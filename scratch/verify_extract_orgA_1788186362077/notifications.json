@@ -1,0 +1,54 @@
+[
+  {
+    "id": "5ec08b4d-f8d9-4dd2-90a7-889b28841af1",
+    "userId": "6befaf96-f142-4aba-b096-4c40875b2318",
+    "title": "New Reimbursement Claim",
+    "message": "Bob Marley submitted a new claim for Health Insurance.",
+    "type": "INFO",
+    "isRead": false,
+    "link": null,
+    "metadata": null,
+    "createdAt": "2026-08-25T07:50:51.344Z",
+    "updatedAt": "2026-08-25T07:50:51.344Z",
+    "organizationId": null
+  },
+  {
+    "id": "80110347-8586-42b8-b6ca-4e45ff42bb7f",
+    "userId": "6befaf96-f142-4aba-b096-4c40875b2318",
+    "title": "New Reimbursement Claim",
+    "message": "Bob Marley submitted a new claim for Health Insurance.",
+    "type": "INFO",
+    "isRead": false,
+    "link": null,
+    "metadata": null,
+    "createdAt": "2026-08-25T07:50:10.442Z",
+    "updatedAt": "2026-08-25T07:50:10.442Z",
+    "organizationId": null
+  },
+  {
+    "id": "ba9d912f-9cbc-44d0-ab07-600257197b65",
+    "userId": "6befaf96-f142-4aba-b096-4c40875b2318",
+    "title": "Leave Approval Pending",
+    "message": "Bob Marley requested 2 days of Sick Leave.",
+    "type": "WARNING",
+    "isRead": false,
+    "link": "/manager/leave",
+    "metadata": null,
+    "createdAt": "2026-08-25T07:50:51.320Z",
+    "updatedAt": "2026-08-25T07:50:51.320Z",
+    "organizationId": null
+  },
+  {
+    "id": "c5925d1c-5515-44c1-b4c0-f0be8a4076d9",
+    "userId": "6befaf96-f142-4aba-b096-4c40875b2318",
+    "title": "Leave Approval Pending",
+    "message": "Bob Marley requested 2 days of Sick Leave.",
+    "type": "WARNING",
+    "isRead": false,
+    "link": "/manager/leave",
+    "metadata": null,
+    "createdAt": "2026-08-25T07:50:10.418Z",
+    "updatedAt": "2026-08-25T07:50:10.418Z",
+    "organizationId": null
+  }
+]

@@ -171,6 +171,8 @@ model Organization {
   Policy               Policy[]
   PolicyAcknowledgment PolicyAcknowledgment[]
   CustomRole           CustomRole[]
+  backupJobs           BackupJob[]
+  googleDriveIntegration GoogleDriveIntegration?
 
   @@map("organization")
 }
@@ -196,6 +198,7 @@ model User {
 
   createdRoles CustomRole[] @relation("RoleCreator")
   updatedRoles CustomRole[] @relation("RoleUpdater")
+  createdBackups BackupJob[] @relation("BackupCreator")
 
   employeeProfile       EmployeeProfile?
   candidateProfile      CandidateProfile?
@@ -1629,4 +1632,58 @@ model WorkCalendarAssignment {
   effectiveTo   DateTime?
 
   @@map("workcalendarassignment")
+}
+
+// ============================================================
+// 35. Organization Backup System
+// ============================================================
+model BackupJob {
+  id              String        @id @default(uuid())
+  organizationId  String
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdByUserId String?
+  createdByUser   User?         @relation("BackupCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  type            String        @default("DATA_ONLY") // "DATA_ONLY" | "DATA_AND_DOCUMENTS"
+  status          String        @default("QUEUED") // "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED" | "EXPIRED"
+  progress        Int           @default(0)
+  progressStep    String?       @default("Initializing")
+  fileName        String?
+  filePath        String?       @db.Text
+  storageProvider String        @default("local") // "local" | "cloud"
+  storageUrl      String?       @db.Text
+  fileSize        BigInt?
+  checksum        String?       // SHA-256
+  recordCounts    String?       @db.Text // JSON string of counts
+  includedModules String?       @db.Text // JSON array of module keys
+  errorMessage    String?       @db.Text
+  completedAt     DateTime?
+  expiresAt       DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("backupjob")
+}
+
+// ============================================================
+// 36. Google Drive Integration (OAuth 2.0 per Organization)
+// ============================================================
+model GoogleDriveIntegration {
+  id              String        @id @default(uuid())
+  organizationId  String        @unique
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  accessToken     String?       @db.Text
+  refreshToken    String?       @db.Text
+  expiryDate      BigInt?
+  accountEmail    String?
+  accountName     String?
+  folderId        String?
+  isConnected     Boolean       @default(false)
+  connectedAt     DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@map("googledriveintegration")
 }

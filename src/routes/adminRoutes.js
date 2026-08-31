@@ -62,8 +62,8 @@ router.get('/stats', checkPermission('dashboard', 'view'), getDashboardStats);
 router.get('/organization', checkPermission('org_setup', 'view'), getOrganization);
 router.post('/organization', checkPermission('org_setup', 'create'), createOrganization);
 router.put('/organization/:id', checkPermission('org_setup', 'edit'), updateOrganization);
-router.patch('/organization/logo', checkPermission('org_setup', 'edit'), upload.single('logo'), updateOrganizationLogo);
-router.post('/organization/logo', checkPermission('org_setup', 'edit'), upload.single('logo'), updateOrganizationLogo);
+router.patch('/organization/logo', checkPermission('org_setup', 'edit'), upload.any(), updateOrganizationLogo);
+router.post('/organization/logo', checkPermission('org_setup', 'edit'), upload.any(), updateOrganizationLogo);
 router.delete('/organization/logo', checkPermission('org_setup', 'edit'), deleteOrganizationLogo);
 router.post('/organizations/:id/complete-setup', checkPermission('org_setup', 'edit'), (req, res) => res.status(200).json({ success: true, message: 'Setup marked complete' }));
 

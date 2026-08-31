@@ -17,12 +17,11 @@ const tenantGuard = async (req, res, next) => {
       });
     }
 
-    // Fetch the tenant status
+    // Fetch the tenant organization with pricing plan relation
     const org = await prisma.organization.findUnique({
       where: { id: req.user.organizationId },
-      select: {
-        status: true,
-        subscriptionStatus: true,
+      include: {
+        pricingPlan: true
       }
     });
 
@@ -36,31 +35,23 @@ const tenantGuard = async (req, res, next) => {
       });
     }
 
-    if (org.status === 'SUSPENDED') {
+    const orgStatus = (org.status || 'ACTIVE').toUpperCase();
+    if (orgStatus === 'SUSPENDED' || orgStatus === 'INACTIVE' || orgStatus === 'DEACTIVATED') {
       return res.status(403).json({
         success: false,
         error: {
-          code: 'TENANT_SUSPENDED',
-          message: 'Your organization account is suspended. Please contact support.'
+          code: 'TENANT_DEACTIVATED',
+          message: 'Your organization account is deactivated. Access to the software is restricted until activated by an administrator.'
         }
       });
     }
 
-    if (org.status === 'INACTIVE') {
-      return res.status(403).json({
-        success: false,
-        error: {
-          code: 'TENANT_INACTIVE',
-          message: 'Your organization account is inactive. Please contact support.'
-        }
-      });
-    }
-
-    // Pass organization status down
-    req.tenant = org;
-    
-    // IMPORTANT: Inject organizationId into query/body to avoid manipulation,
-    // though it's safer to always use req.user.organizationId in controllers.
+    // Pass organization and subscription helpers down
+    req.tenant = {
+      ...org,
+      plan: org.pricingPlan?.name || 'Professional',
+      maxEmployees: org.pricingPlan?.maxEmployees || 500,
+    };
     
     next();
   } catch (err) {

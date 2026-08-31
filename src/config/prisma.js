@@ -1,19 +1,11 @@
 // ============================================================
 // Prisma Client - Singleton Instance
 // ============================================================
-// Prevent connection leaks and multiple instances across nodemon reloads
+// Prisma ko ek baar initialize karo aur poore app mein reuse karo
+// Multiple instances se "too many connections" error aata hai
 
 const { PrismaClient } = require('@prisma/client');
 
-const globalForPrisma = global;
-
-const prisma = globalForPrisma.__prismaInstance || new PrismaClient({
-  log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
-});
-
-if (process.env.NODE_ENV !== 'production') {
-  globalForPrisma.__prismaInstance = prisma;
-}
+const prisma = new PrismaClient();
 
 module.exports = prisma;
-

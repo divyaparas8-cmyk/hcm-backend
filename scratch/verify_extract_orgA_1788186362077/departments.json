@@ -1,0 +1,38 @@
+[
+  {
+    "id": "22be0f18-c66b-40e2-a82d-33f63402901f",
+    "name": "Human Resources",
+    "code": null,
+    "head": null,
+    "parent": "Corporate",
+    "parentId": null,
+    "description": null,
+    "color": "#4f46e5",
+    "status": "Active",
+    "organizationId": "3b82ade8-19a3-4434-8029-7183d28a6877"
+  },
+  {
+    "id": "91fe281c-22f1-4517-afb2-eeb149c26e7f",
+    "name": "Product & Design",
+    "code": null,
+    "head": null,
+    "parent": "Corporate",
+    "parentId": null,
+    "description": null,
+    "color": "#4f46e5",
+    "status": "Active",
+    "organizationId": "3b82ade8-19a3-4434-8029-7183d28a6877"
+  },
+  {
+    "id": "a8248b0d-93aa-4b5f-b255-75a05e30b754",
+    "name": "Engineering",
+    "code": null,
+    "head": null,
+    "parent": "Corporate",
+    "parentId": null,
+    "description": null,
+    "color": "#4f46e5",
+    "status": "Active",
+    "organizationId": "3b82ade8-19a3-4434-8029-7183d28a6877"
+  }
+]

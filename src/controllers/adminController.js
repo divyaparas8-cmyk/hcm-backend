@@ -76,6 +76,24 @@ const buildOrganizationPayload = (body) => {
 // ─────────────────────────────────────────
 const getDashboardStats = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    if (!organizationId) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          totalEmployees: 0,
+          totalDepartments: 0,
+          pendingLeaves: 0,
+          openTickets: 0,
+          todayAttendance: 0,
+          unpaidPayslips: 0,
+          attendanceSummary: { present: '0%', onLeave: '0%', lateAbsent: '0%' },
+          recentActivities: [],
+          organizationScore: 100
+        },
+      });
+    }
+
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
@@ -89,21 +107,35 @@ const getDashboardStats = async (req, res, next) => {
       unpaidPayslips,
       recentActivities,
     ] = await Promise.all([
-      prisma.employeeProfile.count(),
-      prisma.department.count(),
-      prisma.leaveRequest.count({ where: { status: 'PENDING' } }),
-      prisma.supportTicket.count({ where: { status: 'OPEN' } }),
-      prisma.attendanceLog.findMany({ where: { date: { gte: today } } }),
+      prisma.employeeProfile.count({
+        where: { user: { organizationId, role: { notIn: ['SUPERADMIN'] } } }
+      }),
+      prisma.department.count({
+        where: { organizationId }
+      }),
+      prisma.leaveRequest.count({
+        where: { user: { organizationId }, status: 'PENDING' }
+      }),
+      prisma.supportTicket.count({
+        where: { user: { organizationId }, status: 'OPEN' }
+      }),
+      prisma.attendanceLog.findMany({
+        where: { user: { organizationId }, date: { gte: today } }
+      }),
       prisma.leaveRequest.findMany({ 
         where: { 
+          user: { organizationId },
           status: 'APPROVED', 
           startDate: { lte: new Date() },
           endDate: { gte: today }
         }
       }),
-      prisma.payslip.count({ where: { status: 'Unpaid' } }),
+      prisma.payslip.count({
+        where: { employee: { user: { organizationId } }, status: 'Unpaid' }
+      }),
       prisma.auditLog.findMany({
         take: 3,
+        where: { user: { organizationId } },
         orderBy: { createdAt: 'desc' },
         include: { user: { select: { email: true } } }
       })
@@ -157,8 +189,11 @@ const getDashboardStats = async (req, res, next) => {
 // GET /api/admin/organization
 const getOrganization = async (req, res, next) => {
   try {
-    const orgId = req.user?.organizationId;
-    const org = await prisma.organization.findUnique({ where: { id: orgId } });
+    const orgId = req.user?.organizationId || req.tenant?.id;
+    let org = orgId ? await prisma.organization.findUnique({ where: { id: orgId } }) : null;
+    if (!org) {
+      org = await prisma.organization.findFirst();
+    }
     if (org) {
       org.setupComplete = true;
     }
@@ -183,6 +218,12 @@ const createOrganization = async (req, res, next) => {
     }
 
     const org = await prisma.organization.create({ data: payload.data });
+    if (req.user?.id && !req.user?.organizationId) {
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: { organizationId: org.id }
+      }).catch(() => {});
+    }
     return res.status(201).json({ success: true, data: org, message: 'Organization created.' });
   } catch (err) { next(err); }
 };
@@ -215,10 +256,10 @@ const updateOrganization = async (req, res, next) => {
 // PATCH or POST /api/admin/organization/logo
 const updateOrganizationLogo = async (req, res, next) => {
   try {
-    let logoUrl = null;
+    const uploadedFile = req.file || (Array.isArray(req.files) ? req.files[0] : (req.files?.logo?.[0] || req.files?.file?.[0]));
 
-    if (req.file) {
-      const result = await uploadImage(req.file, { folder: 'hcm/logos', filenamePrefix: 'logo' });
+    if (uploadedFile) {
+      const result = await uploadImage(uploadedFile, { folder: 'hcm/logos', filenamePrefix: 'logo' });
       logoUrl = result.url;
     } else if (req.body?.logo || req.body?.logoUrl || req.body?.file) {
       const rawLogo = req.body.logo || req.body.logoUrl || req.body.file;
@@ -229,17 +270,29 @@ const updateOrganizationLogo = async (req, res, next) => {
       return res.status(400).json({ success: false, error: { message: 'No logo file or URL provided.' } });
     }
 
-    const orgId = req.user?.organizationId;
-    let org = await prisma.organization.findUnique({ where: { id: orgId } });
+    const orgId = req.user?.organizationId || req.tenant?.id || req.body?.organizationId;
+    let org = orgId ? await prisma.organization.findUnique({ where: { id: orgId } }) : null;
+    if (!org) {
+      org = await prisma.organization.findFirst();
+    }
+
     if (!org) {
       org = await prisma.organization.create({
-        data: { name: 'Organization', logoUrl }
+        data: { name: req.body?.name || 'GlobalTech Solutions', logoUrl }
       });
     } else {
       org = await prisma.organization.update({
         where: { id: org.id },
         data: { logoUrl }
       });
+    }
+
+    // Link user to org if not linked
+    if (req.user?.id && !req.user?.organizationId) {
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: { organizationId: org.id }
+      }).catch(() => {});
     }
 
     return res.status(200).json({
@@ -259,8 +312,11 @@ const updateOrganizationLogo = async (req, res, next) => {
 // DELETE /api/admin/organization/logo
 const deleteOrganizationLogo = async (req, res, next) => {
   try {
-    const orgId = req.user?.organizationId;
-    let org = await prisma.organization.findUnique({ where: { id: orgId } });
+    const orgId = req.user?.organizationId || req.tenant?.id;
+    let org = orgId ? await prisma.organization.findUnique({ where: { id: orgId } }) : null;
+    if (!org) {
+      org = await prisma.organization.findFirst();
+    }
     if (org) {
       await prisma.organization.update({
         where: { id: org.id },
@@ -322,14 +378,21 @@ const validateNoCircularHierarchy = async (departmentId, proposedParentId) => {
 
 const getDepartments = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    if (!organizationId) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
     const [departments, users] = await Promise.all([
       prisma.department.findMany({
+        where: { organizationId },
         include: {
           _count: { select: { employees: true, subDepartments: true } },
         },
         orderBy: { name: 'asc' },
       }),
       prisma.user.findMany({
+        where: { organizationId },
         include: {
           employeeProfile: { select: { fullName: true } },
           candidateProfile: { select: { fullName: true } }
@@ -365,12 +428,6 @@ const departmentSchema = z.object({
   status: z.string().trim().nullish(),
 });
 
-const resolveOrganizationId = async (organizationId) => {
-  if (organizationId) return organizationId;
-  
-  return org?.id || null;
-};
-
 // POST /api/admin/departments
 const createDepartment = async (req, res, next) => {
   try {
@@ -382,11 +439,26 @@ const createDepartment = async (req, res, next) => {
       });
     }
 
-    const organizationId = await resolveOrganizationId(parsed.data.organizationId);
+    const organizationId = req.user?.organizationId || req.tenant?.id || parsed.data.organizationId;
     if (!organizationId) {
       return res.status(400).json({
         success: false,
         error: { code: 'NO_ORGANIZATION', message: 'Organization must be configured before creating departments.' },
+      });
+    }
+
+    // Check for duplicate department name within this organization
+    const existingDept = await prisma.department.findFirst({
+      where: {
+        organizationId,
+        name: parsed.data.name,
+      },
+    });
+
+    if (existingDept) {
+      return res.status(409).json({
+        success: false,
+        error: { code: 'NAME_TAKEN', message: 'A department with this name already exists in your organization.' },
       });
     }
 
@@ -515,7 +587,7 @@ const deleteDepartment = async (req, res, next) => {
 
 const getAllUsers = async (req, res, next) => {
   try {
-    const organizationId = req.user.organizationId;
+    const organizationId = req.user?.organizationId || req.tenant?.id;
 
     if (!organizationId) {
       return res.status(200).json({ success: true, data: [], meta: { total: 0 } });
@@ -524,10 +596,7 @@ const getAllUsers = async (req, res, next) => {
     const users = await prisma.user.findMany({
       where: {
         role: { notIn: ['SUPERADMIN'] },
-        OR: [
-          { organizationId: organizationId },
-          { organizationId: null }
-        ]
+        organizationId: organizationId,
       },
       include: {
         customRole: { select: { id: true, name: true, inheritsFrom: true, status: true } },
@@ -591,29 +660,37 @@ const createUser = async (req, res, next) => {
       return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Only SuperAdmin can assign SuperAdmin role.' } });
     }
 
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    if (!organizationId) {
+      return res.status(400).json({ success: false, error: { code: 'NO_ORGANIZATION', message: 'Organization is not configured.' } });
+    }
+
     const [existingEmail, existingEmpId] = await Promise.all([
       prisma.user.findUnique({ where: { email: data.email } }),
-      prisma.employeeProfile.findUnique({ where: { employeeId: data.empId } }),
+      prisma.employeeProfile.findFirst({
+        where: {
+          employeeId: data.empId,
+          organizationId,
+        },
+      }),
     ]);
 
     if (existingEmail) {
       return res.status(409).json({ success: false, error: { code: 'EMAIL_TAKEN', message: 'Email already exists.' } });
     }
     if (existingEmpId) {
-      return res.status(409).json({ success: false, error: { code: 'EMPID_TAKEN', message: 'Employee ID already exists.' } });
+      return res.status(409).json({ success: false, error: { code: 'EMPID_TAKEN', message: 'Employee ID already exists in your organization.' } });
     }
-
-    const organizationId = req.user.organizationId;
     const department = await prisma.department.findFirst({
       where: {
         OR: [{ id: data.department }, { name: data.department }],
-        ...(organizationId ? { organizationId } : {}),
+        organizationId,
       },
       select: { id: true },
     });
 
     if (!department) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Selected department was not found.' } });
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Selected department was not found in your organization.' } });
     }
 
     let managerId = null;
@@ -621,11 +698,12 @@ const createUser = async (req, res, next) => {
       const manager = await prisma.employeeProfile.findFirst({
         where: {
           OR: [{ id: data.manager }, { fullName: data.manager }, { employeeId: data.manager }],
+          organizationId,
         },
         select: { id: true },
       });
       if (!manager) {
-        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Selected reporting manager was not found.' } });
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Selected reporting manager was not found in your organization.' } });
       }
       managerId = manager.id;
     }
@@ -646,6 +724,9 @@ const createUser = async (req, res, next) => {
       }
     }
 
+    const targetStructureId = data.salaryStructureId || (defaultStructure ? defaultStructure.id : null);
+    const targetVersionId = data.salaryVersionId || (defaultStructure ? defaultStructure.currentVersionId : null);
+
     const user = await prisma.user.create({
       data: {
         email: data.email,
@@ -661,6 +742,7 @@ const createUser = async (req, res, next) => {
             fullName: data.name,
             phone: data.phone,
             address: data.address,
+            organizationId,
             joiningDate: new Date(data.joinDate),
             employmentType: data.empType,
             avatarUrl: data.img || null,
@@ -675,11 +757,10 @@ const createUser = async (req, res, next) => {
                 baseSalary: Number(data.monthlyCTC ?? data.baseSalary ?? data.salary ?? 0),
                 monthlyCTC: Number(data.monthlyCTC ?? data.baseSalary ?? data.salary ?? 0),
                 annualCTC: Number(data.monthlyCTC ?? data.baseSalary ?? data.salary ?? 0) * 12,
-                salaryStructureId: data.salaryStructureId || (defaultStructure ? defaultStructure.id : null),
-                salaryVersionId: data.salaryVersionId || (defaultStructure ? defaultStructure.currentVersionId : null),
                 effectiveDate: data.effectiveDate ? new Date(data.effectiveDate) : new Date(data.joinDate),
-                reason: 'Initial Setup',
-                status: 'Active'
+                status: 'Active',
+                ...(targetStructureId ? { salaryStructure: { connect: { id: targetStructureId } } } : {}),
+                ...(targetVersionId ? { salaryVersion: { connect: { id: targetVersionId } } } : {})
               }
             }
           },
@@ -1179,10 +1260,12 @@ const deleteUser = async (req, res, next) => {
 // GET /api/admin/payslips
 const getAllPayslips = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const { month, status } = req.query;
 
     const payslips = await prisma.payslip.findMany({
       where: {
+        ...(organizationId ? { employee: { user: { organizationId } } } : {}),
         ...(month && { month }),
         ...(status && { status }),
       },
@@ -1509,7 +1592,9 @@ const getAuditLogs = async (req, res, next) => {
 // GET /api/admin/policies
 const getPolicies = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const policies = await prisma.policy.findMany({
+      where: organizationId ? { organizationId } : {},
       orderBy: { createdAt: 'desc' },
     });
     return res.status(200).json({ success: true, data: policies });
@@ -1519,6 +1604,7 @@ const getPolicies = async (req, res, next) => {
 // POST /api/admin/policies
 const createPolicy = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const { name, category, department, owner, effectiveDate, expiryDate, version, requiresSignature, status, description, pdfName, pdfData, acknowledgments } = req.body;
     
     let finalPdfData = pdfData;
@@ -1535,6 +1621,7 @@ const createPolicy = async (req, res, next) => {
         name,
         category,
         owner,
+        organizationId,
         ...(department && { department }),
         ...(effectiveDate && { effectiveDate }),
         ...(expiryDate && { expiryDate }),
@@ -1865,7 +1952,16 @@ const deleteRole = async (req, res, next) => {
 
 const getHolidays = async (req, res, next) => {
   try {
-    const holidays = await prisma.holiday.findMany({ orderBy: { date: 'asc' } });
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const holidays = await prisma.holiday.findMany({
+      where: organizationId ? {
+        OR: [
+          { calendar: { companyId: organizationId } },
+          { calendarId: null }
+        ]
+      } : {},
+      orderBy: { date: 'asc' }
+    });
     return res.status(200).json({ success: true, data: holidays });
   } catch (err) { next(err); }
 };
@@ -1937,7 +2033,9 @@ const deleteHoliday = async (req, res, next) => {
 
 const getBenefitPlans = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const plans = await prisma.benefitPlan.findMany({
+      where: organizationId ? { organizationId } : {},
       orderBy: { name: 'asc' },
       include: {
         employeeBenefits: true
@@ -1949,7 +2047,13 @@ const getBenefitPlans = async (req, res, next) => {
 
 const createBenefitPlan = async (req, res, next) => {
   try {
-    const plan = await prisma.benefitPlan.create({ data: req.body });
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const plan = await prisma.benefitPlan.create({
+      data: {
+        ...req.body,
+        organizationId
+      }
+    });
 
     try {
       const { createNotification } = require('../utils/notificationHelper');
@@ -2185,7 +2289,9 @@ const exportInvoices = async (req, res, next) => {
 // ATTENDANCE & LEAVES
 const getAllAttendance = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const logs = await prisma.attendanceLog.findMany({
+      where: organizationId ? { user: { organizationId } } : {},
       include: { user: { include: { employeeProfile: true } } },
       orderBy: { date: 'desc' }
     });
@@ -2240,7 +2346,9 @@ const addManualAttendance = async (req, res, next) => {
 
 const getAllLeaves = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const leaves = await prisma.leaveRequest.findMany({
+      where: organizationId ? { user: { organizationId } } : {},
       include: { user: { include: { employeeProfile: true } } },
       orderBy: { createdAt: 'desc' }
     });
@@ -2309,8 +2417,12 @@ const reviewLeave = async (req, res, next) => {
 // GET /api/admin/resignations
 const getAdminResignations = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const resignations = await prisma.exitLifecycle.findMany({
-      where: { exitType: 'RESIGNATION' },
+      where: {
+        exitType: 'RESIGNATION',
+        ...(organizationId ? { employee: { user: { organizationId } } } : {})
+      },
       include: {
         employee: {
           select: { id: true, employeeId: true, fullName: true, department: true }

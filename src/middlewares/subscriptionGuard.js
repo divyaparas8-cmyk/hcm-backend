@@ -15,36 +15,56 @@ const subscriptionGuard = (requiredFeature) => {
         });
       }
 
-      const { subscriptionStatus, plan } = req.tenant;
+      const { subscriptionStatus, plan, maxEmployees, pricingPlan } = req.tenant;
+      const statusUpper = (subscriptionStatus || 'ACTIVE').toUpperCase();
 
       // Basic guard against cancelled or suspended subscriptions
-      if (['SUSPENDED', 'CANCELLED', 'EXPIRED'].includes(subscriptionStatus)) {
+      if (['SUSPENDED', 'CANCELLED', 'EXPIRED'].includes(statusUpper)) {
         return res.status(402).json({
           success: false,
           error: {
             code: 'SUBSCRIPTION_INACTIVE',
-            message: `Your organization's subscription is ${subscriptionStatus.toLowerCase()}. Please renew to continue.`
+            message: `Your organization's subscription is ${subscriptionStatus ? subscriptionStatus.toLowerCase() : 'inactive'}. Please renew to continue.`
           }
         });
       }
 
-      // Enforce feature flags
-      if (requiredFeature && !plans[plan]?.features.includes(requiredFeature)) {
-        return res.status(403).json({
-          success: false,
-          error: { code: 'FEATURE_NOT_ALLOWED', message: 'Your current plan does not support this feature.' }
-        });
-      }
-
-      // Seat Limit check
-      if (requiredFeature === 'ADD_EMPLOYEE') {
-        const maxSeats = plans[plan]?.limits?.maxSeats || 0;
-        const empCount = await prisma.user.count({ where: { organizationId: req.tenant.id }});
+      // Feature validation
+      if (requiredFeature) {
+        const standardCoreFeatures = ['ADD_EMPLOYEE', 'VIEW_DASHBOARD', 'PAYROLL', 'ATTENDANCE', 'LEAVES', 'DOCUMENTS', 'PERFORMANCE'];
         
-        if (empCount >= maxSeats) {
+        // Normalize plan name key (e.g. 'Professional' -> 'PRO', 'Enterprise' -> 'ENTERPRISE', 'Free' -> 'FREE')
+        const planKey = (plan || 'PRO').toUpperCase().includes('FREE') ? 'FREE' 
+          : (plan || 'PRO').toUpperCase().includes('ENTERPRISE') ? 'ENTERPRISE' 
+          : 'PRO';
+        
+        const planConfig = plans[planKey] || plans.PRO;
+        const customPlanFeatures = Array.isArray(pricingPlan?.features) ? pricingPlan.features : [];
+
+        const isAllowed = standardCoreFeatures.includes(requiredFeature) ||
+          planConfig?.features?.includes(requiredFeature) ||
+          customPlanFeatures.includes(requiredFeature);
+
+        if (!isAllowed) {
           return res.status(403).json({
             success: false,
-            error: { code: 'SEAT_LIMIT_REACHED', message: 'Maximum seat limit reached for your plan.' }
+            error: { code: 'FEATURE_NOT_ALLOWED', message: 'Your current plan does not support this feature.' }
+          });
+        }
+      }
+
+      // Dynamic Seat Limit check based on tenant organization's maxEmployees
+      if (requiredFeature === 'ADD_EMPLOYEE') {
+        const seatLimit = maxEmployees || pricingPlan?.maxEmployees || 500;
+        const empCount = await prisma.user.count({ where: { organizationId: req.tenant.id } });
+        
+        if (seatLimit > 0 && empCount >= seatLimit) {
+          return res.status(403).json({
+            success: false,
+            error: { 
+              code: 'SEAT_LIMIT_REACHED', 
+              message: `Maximum seat limit (${seatLimit}) reached for your plan. Please upgrade to add more employees.` 
+            }
           });
         }
       }

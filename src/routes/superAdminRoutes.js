@@ -10,7 +10,7 @@ const { protect, authorize } = require('../middlewares/authMiddleware');
 
 const {
   getPlatformStats,
-  getAllOrganizations, createOrganization, deleteOrganization, updateOrgSubscription,
+  getAllOrganizations, getOrganizationDetails, provisionOrganization, suspendOrganization, activateOrganization, createOrganization, deleteOrganization, updateOrgSubscription,
   getAllPlatformUsers, createAdminForOrg,
   toggleAnyUserActive, changeAnyUserRole, revokeAnyUserRole,
   getPlatformAuditLogs,
@@ -43,7 +43,11 @@ router.put('/settings', updateSystemSettings);
 
 // Organizations (multi-tenant management)
 router.get('/organizations', getAllOrganizations);   // GET  /api/superadmin/organizations
+router.get('/organizations/:id', getOrganizationDetails); // GET /api/superadmin/organizations/:id
 router.post('/organizations', createOrganization);   // POST /api/superadmin/organizations
+router.post('/organizations/provision', provisionOrganization); // POST /api/superadmin/organizations/provision
+router.patch('/organizations/:id/suspend', suspendOrganization); // PATCH /api/superadmin/organizations/:id/suspend
+router.patch('/organizations/:id/activate', activateOrganization); // PATCH /api/superadmin/organizations/:id/activate
 router.put('/organizations/:id/subscription', updateOrgSubscription); // PUT /api/superadmin/organizations/:id/subscription
 router.delete('/organizations/:id', deleteOrganization);   // DEL  /api/superadmin/organizations/:id
 router.post('/organizations/:orgId/create-admin', createAdminForOrg); // POST /api/superadmin/organizations/:orgId/create-admin

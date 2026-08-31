@@ -57,7 +57,11 @@ const getPlatformStats = async (req, res, next) => {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
 
-    const [activeTimeLogsToday, employeesWithBenefits, totalAiRequests, organizationsWithPlans] = await Promise.all([
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+
+    const [activeTimeLogsToday, employeesWithBenefits, totalAiRequests, organizationsWithPlans, newOrgsThisMonth] = await Promise.all([
       prisma.attendanceLog.count({
         where: { createdAt: { gte: startOfDay } }
       }),
@@ -67,6 +71,9 @@ const getPlatformStats = async (req, res, next) => {
       prisma.aiLog.count(),
       prisma.organization.findMany({
         include: { pricingPlan: true }
+      }),
+      prisma.organization.count({
+        where: { createdAt: { gte: startOfMonth } }
       })
     ]);
 
@@ -104,7 +111,8 @@ const getPlatformStats = async (req, res, next) => {
       arr: Math.round(arr),
       acv: organizationsWithPlans.length > 0 ? Math.round(arr / organizationsWithPlans.length) : 0,
       activeTenants: totalOrganizations,
-      momGrowth: 0, // Requires historical billing data
+      newOrgsThisMonth,
+      momGrowth: 0,
       planDistribution
     };
 
@@ -143,10 +151,12 @@ const getAllOrganizations = async (req, res, next) => {
   try {
     const orgs = await prisma.organization.findMany({
       include: {
+        pricingPlan: true,
         _count: {
           select: {
             users: true,
             departments: true,
+            employeeProfiles: true,
           },
         },
       },
@@ -154,6 +164,199 @@ const getAllOrganizations = async (req, res, next) => {
     });
 
     return res.status(200).json({ success: true, data: orgs, meta: { total: orgs.length } });
+  } catch (err) { next(err); }
+};
+
+// GET /api/superadmin/organizations/:id (single tenant details)
+const getOrganizationDetails = async (req, res, next) => {
+  try {
+    const org = await prisma.organization.findUnique({
+      where: { id: req.params.id },
+      include: {
+        pricingPlan: true,
+        departments: {
+          select: { id: true, name: true, _count: { select: { employees: true } } }
+        },
+        _count: {
+          select: {
+            users: true,
+            departments: true,
+            employeeProfiles: true,
+          },
+        },
+      },
+    });
+
+    if (!org) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Organization not found.' } });
+    }
+
+    return res.status(200).json({ success: true, data: org });
+  } catch (err) { next(err); }
+};
+
+// POST /api/superadmin/organizations/provision (full tenant + admin + plan provision)
+const provisionOrganization = async (req, res, next) => {
+  try {
+    const schema = z.object({
+      organization: z.object({
+        name: z.string().min(2, 'Organization name is required'),
+        industry: z.string().optional().nullable(),
+        country: z.string().optional().nullable(),
+      }),
+      admin: z.object({
+        fullName: z.string().min(2, 'Admin full name is required'),
+        email: z.string().email('Valid admin email is required'),
+        password: z.string().optional().nullable(),
+      }),
+      subscription: z.object({
+        plan: z.string().optional().nullable(),
+        billingCycle: z.string().optional().nullable(),
+      }).optional().nullable()
+    });
+
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: parsed.error.issues?.[0]?.message || 'Validation error' }
+      });
+    }
+
+    const { organization, admin, subscription } = parsed.data;
+
+    // Check if admin email already exists
+    const existingUser = await prisma.user.findUnique({ where: { email: admin.email } });
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        error: { code: 'EMAIL_TAKEN', message: 'An account with this admin email already exists.' }
+      });
+    }
+
+    // Resolve plan details
+    const selectedPlanName = subscription?.plan || 'Trial';
+    let matchedPlan = null;
+    let subscriptionStatus = 'ACTIVE';
+    let subscriptionEnd = null;
+
+    if (selectedPlanName === 'Trial' || selectedPlanName.toLowerCase().includes('trial')) {
+      subscriptionStatus = 'TRIAL';
+      subscriptionEnd = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+    } else {
+      matchedPlan = await prisma.pricingPlan.findFirst({
+        where: {
+          OR: [
+            { id: selectedPlanName },
+            { name: { equals: selectedPlanName } }
+          ]
+        }
+      });
+    }
+
+    const defaultAdminPassword = admin.password || '12345678';
+    const passwordHash = await bcrypt.hash(defaultAdminPassword, 10);
+
+    // Atomically create Organization, default department, and admin user
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Create Organization
+      const org = await tx.organization.create({
+        data: {
+          name: organization.name,
+          industry: organization.industry || 'Technology',
+          address: organization.country || null,
+          status: 'ACTIVE',
+          subscriptionStatus,
+          subscriptionStart: new Date(),
+          subscriptionEnd,
+          pricingPlanId: matchedPlan?.id || null,
+        }
+      });
+
+      // 2. Create Default Department
+      const defaultDept = await tx.department.create({
+        data: {
+          name: 'Management',
+          organizationId: org.id,
+          code: 'MGMT',
+          status: 'Active'
+        }
+      });
+
+      // 3. Create Admin User & Employee Profile
+      const user = await tx.user.create({
+        data: {
+          email: admin.email,
+          passwordHash,
+          role: 'ADMIN',
+          isActive: true,
+          status: 'Active',
+          organizationId: org.id,
+          employeeProfile: {
+            create: {
+              fullName: admin.fullName,
+              employeeId: 'EMP-001',
+              departmentId: defaultDept.id,
+              joiningDate: new Date(),
+              employmentType: 'Full-time',
+              address: organization.country || 'Headquarters'
+            }
+          }
+        },
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          employeeProfile: {
+            select: { id: true, fullName: true, employeeId: true }
+          }
+        }
+      });
+
+      return { org, user };
+    });
+
+    if (req.user) {
+      await prisma.auditLog.create({
+        data: {
+          userId: req.user.userId,
+          action: 'PROVISION_ORGANIZATION',
+          details: `Provisioned organization "${organization.name}" with admin "${admin.email}" on plan "${selectedPlanName}"`,
+          ipAddress: req.ip || req.socket.remoteAddress
+        }
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      data: result,
+      message: `Organization "${organization.name}" provisioned successfully with Admin ${admin.email}.`
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+// PATCH /api/superadmin/organizations/:id/suspend
+const suspendOrganization = async (req, res, next) => {
+  try {
+    const org = await prisma.organization.update({
+      where: { id: req.params.id },
+      data: { status: 'SUSPENDED' }
+    });
+    return res.status(200).json({ success: true, data: org, message: 'Organization suspended.' });
+  } catch (err) { next(err); }
+};
+
+// PATCH /api/superadmin/organizations/:id/activate
+const activateOrganization = async (req, res, next) => {
+  try {
+    const org = await prisma.organization.update({
+      where: { id: req.params.id },
+      data: { status: 'ACTIVE' }
+    });
+    return res.status(200).json({ success: true, data: org, message: 'Organization activated.' });
   } catch (err) { next(err); }
 };
 
@@ -189,28 +392,127 @@ const createOrganization = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// DELETE /api/superadmin/organizations/:id  (org + all its data permanently delete)
+// DELETE /api/superadmin/organizations/:id  (org + all its users & data permanently deleted)
 const deleteOrganization = async (req, res, next) => {
   try {
-    // Check: org exists?
-    const org = await prisma.organization.findUnique({ where: { id: req.params.id } });
+    const orgId = req.params.id;
+    const org = await prisma.organization.findUnique({
+      where: { id: orgId }
+    });
     if (!org) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Organization not found.' } });
 
-    await prisma.organization.delete({ where: { id: req.params.id } });
+    await prisma.$transaction(async (tx) => {
+      // 1. Find all users belonging to this organization
+      const usersInOrg = await tx.user.findMany({
+        where: { organizationId: orgId },
+        select: { id: true }
+      });
+      const userIds = usersInOrg.map(u => u.id);
+
+      // 2. Find all employee profiles belonging to this organization
+      const empProfiles = await tx.employeeProfile.findMany({
+        where: { organizationId: orgId },
+        select: { id: true }
+      });
+      const empIds = empProfiles.map(e => e.id);
+
+      // 3. Clean up employee records
+      if (empIds.length > 0) {
+        await tx.approvalLog.deleteMany({ where: { approverId: { in: empIds } } });
+        await tx.payrollSnapshot.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.payslip.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.bonus.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.salaryIncrementRequest.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.employeeSalaryComponent.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.employeeDeduction.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.employeeBenefit.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.benefitClaim.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.performanceGoal.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.performanceReview.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.task.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.employeeSkill.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.compensationVersion.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.compensationProfile.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.exitLifecycle.deleteMany({ where: { employeeId: { in: empIds } } });
+        await tx.employeeProfile.updateMany({ where: { managerId: { in: empIds } }, data: { managerId: null } });
+        await tx.employeeProfile.deleteMany({ where: { id: { in: empIds } } });
+      }
+
+      // 4. Clean up user-level tables
+      if (userIds.length > 0) {
+        await tx.ticketMessage.deleteMany({ where: { senderId: { in: userIds } } });
+        await tx.supportTicket.deleteMany({ where: { userId: { in: userIds } } });
+        await tx.attendanceLog.deleteMany({ where: { userId: { in: userIds } } });
+        await tx.leaveRequest.deleteMany({ where: { userId: { in: userIds } } });
+        await tx.document.deleteMany({ where: { userId: { in: userIds } } });
+        await tx.notification.deleteMany({ where: { userId: { in: userIds } } });
+        await tx.policyAcknowledgment.deleteMany({ where: { userId: { in: userIds } } });
+        await tx.auditLog.updateMany({ where: { userId: { in: userIds } }, data: { userId: null } });
+        await tx.user.deleteMany({ where: { id: { in: userIds } } });
+      }
+
+      // 5. Clean up org-level modules and candidate/recruitment data
+      const jobsInOrg = await tx.jobPost.findMany({ where: { organizationId: orgId }, select: { id: true } });
+      const jobIds = jobsInOrg.map(j => j.id);
+      if (jobIds.length > 0) {
+        const apps = await tx.jobApplication.findMany({ where: { jobPostId: { in: jobIds } }, select: { id: true } });
+        const appIds = apps.map(a => a.id);
+        if (appIds.length > 0) {
+          await tx.interview.deleteMany({ where: { applicationId: { in: appIds } } });
+          await tx.offer.deleteMany({ where: { applicationId: { in: appIds } } });
+          await tx.onboarding.deleteMany({ where: { applicationId: { in: appIds } } });
+          await tx.jobApplication.deleteMany({ where: { id: { in: appIds } } });
+        }
+        await tx.jobPost.deleteMany({ where: { id: { in: jobIds } } });
+      }
+
+      const structInOrg = await tx.salaryStructure.findMany({ where: { organizationId: orgId }, select: { id: true } });
+      const structIds = structInOrg.map(s => s.id);
+      if (structIds.length > 0) {
+        await tx.salaryStructureVersion.deleteMany({ where: { salaryStructureId: { in: structIds } } });
+        await tx.salaryStructure.deleteMany({ where: { id: { in: structIds } } });
+      }
+
+      await tx.salaryComponent.deleteMany({ where: { organizationId: orgId } });
+      await tx.salaryBand.deleteMany({ where: { organizationId: orgId } });
+      await tx.deductionRule.deleteMany({ where: { organizationId: orgId } });
+      await tx.taxRule.deleteMany({ where: { organizationId: orgId } });
+      await tx.benefitPlan.deleteMany({ where: { organizationId: orgId } });
+      await tx.approvalWorkflow.deleteMany({ where: { organizationId: orgId } });
+      await tx.payrollConfiguration.deleteMany({ where: { organizationId: orgId } });
+      await tx.leavePolicy.deleteMany({ where: { organizationId: orgId } });
+      await tx.attendancePolicy.deleteMany({ where: { organizationId: orgId } });
+      await tx.policyAcknowledgment.deleteMany({ where: { organizationId: orgId } });
+      await tx.policy.deleteMany({ where: { organizationId: orgId } });
+      await tx.workCalendar.deleteMany({ where: { organizationId: orgId } });
+      await tx.shift.deleteMany({ where: { organizationId: orgId } });
+      await tx.overtimePolicy.deleteMany({ where: { organizationId: orgId } });
+      await tx.holiday.deleteMany({ where: { organizationId: orgId } });
+      await tx.customRole.deleteMany({ where: { organizationId: orgId } });
+      await tx.document.deleteMany({ where: { organizationId: orgId } });
+      await tx.notification.deleteMany({ where: { organizationId: orgId } });
+      await tx.department.deleteMany({ where: { organizationId: orgId } });
+
+      // 6. Delete Organization
+      await tx.organization.delete({ where: { id: orgId } });
+    });
 
     if (req.user) {
       await prisma.auditLog.create({
         data: {
           userId: req.user.userId,
           action: 'DELETE_ORGANIZATION',
-          details: `Deleted organization "${org.name}"`,
+          details: `Deleted organization "${org.name}" and all associated users and records.`,
           ipAddress: req.ip || req.socket.remoteAddress
         }
       });
     }
 
-    return res.status(200).json({ success: true, message: `Organization "${org.name}" deleted permanently.` });
-  } catch (err) { next(err); }
+    return res.status(200).json({ success: true, message: `Organization "${org.name}" and all associated users deleted successfully.` });
+  } catch (err) {
+    console.error('deleteOrganization error:', err);
+    next(err);
+  }
 };
 
 // ─────────────────────────────────────────
@@ -847,6 +1149,64 @@ const deleteUser = async (req, res, next) => {
       return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Super Admin accounts cannot be deleted.' } });
     }
 
+    const shouldDeleteOrg = (req.query.deleteOrg === 'true' || req.body?.deleteOrg === true) && existing.organizationId;
+
+    if (shouldDeleteOrg) {
+      const orgId = existing.organizationId;
+      const org = await prisma.organization.findUnique({ where: { id: orgId } });
+      if (org) {
+        await prisma.$transaction(async (tx) => {
+          const usersInOrg = await tx.user.findMany({ where: { organizationId: orgId }, select: { id: true } });
+          const userIds = usersInOrg.map(u => u.id);
+
+          const empProfiles = await tx.employeeProfile.findMany({ where: { organizationId: orgId }, select: { id: true } });
+          const empIds = empProfiles.map(e => e.id);
+
+          if (empIds.length > 0) {
+            await tx.approvalLog.deleteMany({ where: { approverId: { in: empIds } } });
+            await tx.payrollSnapshot.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.payslip.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.bonus.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.salaryIncrementRequest.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.employeeSalaryComponent.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.employeeDeduction.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.employeeBenefit.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.benefitClaim.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.performanceGoal.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.performanceReview.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.task.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.employeeSkill.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.compensationVersion.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.compensationProfile.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.exitLifecycle.deleteMany({ where: { employeeId: { in: empIds } } });
+            await tx.employeeProfile.deleteMany({ where: { id: { in: empIds } } });
+          }
+
+          if (userIds.length > 0) {
+            await tx.ticketMessage.deleteMany({ where: { senderId: { in: userIds } } });
+            await tx.supportTicket.deleteMany({ where: { userId: { in: userIds } } });
+            await tx.attendanceLog.deleteMany({ where: { userId: { in: userIds } } });
+            await tx.leaveRequest.deleteMany({ where: { userId: { in: userIds } } });
+            await tx.document.deleteMany({ where: { userId: { in: userIds } } });
+            await tx.notification.deleteMany({ where: { userId: { in: userIds } } });
+            await tx.policyAcknowledgment.deleteMany({ where: { userId: { in: userIds } } });
+            await tx.auditLog.updateMany({ where: { userId: { in: userIds } }, data: { userId: null } });
+            await tx.user.deleteMany({ where: { id: { in: userIds } } });
+          }
+
+          await tx.jobPost.deleteMany({ where: { organizationId: orgId } });
+          await tx.department.deleteMany({ where: { organizationId: orgId } });
+          await tx.shift.deleteMany({ where: { organizationId: orgId } });
+          await tx.overtimePolicy.deleteMany({ where: { organizationId: orgId } });
+          await tx.holiday.deleteMany({ where: { organizationId: orgId } });
+          await tx.customRole.deleteMany({ where: { organizationId: orgId } });
+          await tx.organization.delete({ where: { id: orgId } });
+        });
+
+        return res.status(200).json({ success: true, message: `User and organization "${org.name}" deleted successfully.` });
+      }
+    }
+
     await prisma.$transaction(async (tx) => {
       // 1. Employee-related cleanup
       if (existing.employeeProfile) {
@@ -972,40 +1332,29 @@ const deleteUser = async (req, res, next) => {
 // ─────────────────────────────────────────
 const getAllPlatformDepartments = async (req, res, next) => {
   try {
-    const [depts, users] = await Promise.all([
-      prisma.department.findMany({
-        include: {
-          organization: { select: { id: true, name: true } },
-          _count: { select: { employees: true } }
-        },
-        orderBy: { name: 'asc' }
-      }),
-      prisma.user.findMany({
-        include: {
-          employeeProfile: { select: { fullName: true } },
-          candidateProfile: { select: { fullName: true } }
-        }
-      })
-    ]);
-
-    const validNames = new Set(
-      users.flatMap(u => [u.employeeProfile?.fullName, u.candidateProfile?.fullName, u.email]).filter(Boolean)
-    );
-
-    const mapped = depts.map(d => {
-      const isValidHead = d.head && d.head !== 'None' && validNames.has(d.head);
-      return {
-        id: d.id,
-        name: d.name,
-        head: isValidHead ? d.head : 'None',
-        count: d._count.employees,
-        organizationId: d.organizationId,
-        organizationName: d.organization?.name || 'Unknown'
-      };
+    const depts = await prisma.department.findMany({
+      include: {
+        organization: { select: { id: true, name: true } },
+        _count: { select: { employees: true } }
+      },
+      orderBy: { name: 'asc' }
     });
 
+    const mapped = depts.map(d => ({
+      id: d.id,
+      name: d.name,
+      code: d.code || '',
+      head: d.head && d.head !== 'None' ? d.head : 'None',
+      count: d._count?.employees || 0,
+      organizationId: d.organizationId,
+      organizationName: d.organization?.name || 'Unknown'
+    }));
+
     return res.status(200).json({ success: true, data: mapped });
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('getAllPlatformDepartments error:', err);
+    next(err);
+  }
 };
 
 const createPlatformDepartment = async (req, res, next) => {
@@ -1682,33 +2031,74 @@ const getGlobalUsage = async (req, res, next) => {
 // ─────────────────────────────────────────
 // PLATFORM FEATURE MANAGEMENT  →  GET /api/superadmin/features
 // ─────────────────────────────────────────
-const DEFAULT_FEATURE_TIERS = {
-  features: [
-    { id: 'attendance_leave', name: 'Attendance & Leave Tracking', category: 'Core HR', description: 'Web clock-in/out, timesheets, and leave management' },
-    { id: 'employee_directory', name: 'Employee Directory & Profiles', category: 'Core HR', description: 'Centralized employee records, docs, and org charts' },
-    { id: 'payroll_operations', name: 'Payroll & Compensation', category: 'Payroll', description: 'Salary components, deductions, tax brackets & pay runs' },
-    { id: 'recruitment_pipeline', name: 'Recruitment & Job Pipeline', category: 'Recruitment', description: 'Job posts, Kanban candidate funnel, and offer letters' },
-    { id: 'ai_resume_scoring', name: 'AI Resume Scoring & Matching', category: 'AI & Automation', description: 'Automated resume analysis, scoring, and matching' },
-    { id: 'benefits_insurance', name: 'Benefits & Insurance Config', category: 'Benefits', description: 'Employee insurance schemes and wellness allowances' },
-    { id: 'performance_kpi', name: 'Performance & KPI Tracking', category: 'Performance', description: '1-on-1 reviews, objectives, and KPI targets' },
-    { id: 'approval_workflows', name: 'Custom Approval Workflows', category: 'Automation', description: 'Multi-level approval chains for leaves & expenses' },
-    { id: 'advanced_reports', name: 'Advanced Analytics & Exports', category: 'Analytics', description: 'Custom report builder and scheduled automated exports' },
-    { id: 'audit_compliance', name: 'Audit Logs & Statutory Compliance', category: 'Security', description: 'Granular audit logs and compliance policy center' }
-  ],
-  plans: {
-    Starter: ['attendance_leave', 'employee_directory', 'performance_kpi'],
-    Professional: ['attendance_leave', 'employee_directory', 'payroll_operations', 'recruitment_pipeline', 'benefits_insurance', 'performance_kpi', 'approval_workflows', 'audit_compliance'],
-    Enterprise: ['attendance_leave', 'employee_directory', 'payroll_operations', 'recruitment_pipeline', 'ai_resume_scoring', 'benefits_insurance', 'performance_kpi', 'approval_workflows', 'advanced_reports', 'audit_compliance']
-  }
-};
-
-let cachedFeatureConfig = null;
+const STANDARD_MODULE_FEATURES = [
+  { id: 'attendance_leave', name: 'Attendance & Leave Tracking', category: 'Core HR', description: 'Web clock-in/out, timesheets, and leave management' },
+  { id: 'employee_directory', name: 'Employee Directory & Profiles', category: 'Core HR', description: 'Centralized employee records, docs, and org charts' },
+  { id: 'payroll_operations', name: 'Payroll & Compensation', category: 'Payroll', description: 'Salary components, deductions, tax brackets & pay runs' },
+  { id: 'recruitment_pipeline', name: 'Recruitment & Job Pipeline', category: 'Recruitment', description: 'Job posts, Kanban candidate funnel, and offer letters' },
+  { id: 'ai_resume_scoring', name: 'AI Resume Scoring & Matching', category: 'AI & Automation', description: 'Automated resume analysis, scoring, and matching' },
+  { id: 'benefits_insurance', name: 'Benefits & Insurance Config', category: 'Benefits', description: 'Employee insurance schemes and wellness allowances' },
+  { id: 'performance_kpi', name: 'Performance & KPI Tracking', category: 'Performance', description: '1-on-1 reviews, objectives, and KPI targets' },
+  { id: 'approval_workflows', name: 'Custom Approval Workflows', category: 'Automation', description: 'Multi-level approval chains for leaves & expenses' },
+  { id: 'advanced_reports', name: 'Advanced Analytics & Exports', category: 'Analytics', description: 'Custom report builder and scheduled automated exports' },
+  { id: 'audit_compliance', name: 'Audit Logs & Statutory Compliance', category: 'Security', description: 'Granular audit logs and compliance policy center' }
+];
 
 const getPlatformFeatures = async (req, res, next) => {
   try {
+    // 1. Fetch real active pricing plans from the database
+    let dbPlans = await prisma.pricingPlan.findMany({
+      where: { isActive: true },
+      include: { features: { orderBy: { displayOrder: 'asc' } } },
+      orderBy: { displayOrder: 'asc' }
+    });
+
+    if (dbPlans.length === 0) {
+      dbPlans = await prisma.pricingPlan.findMany({
+        include: { features: { orderBy: { displayOrder: 'asc' } } },
+        orderBy: { displayOrder: 'asc' }
+      });
+    }
+
+    const plansFeaturesMap = {};
+    const plansList = [];
+
+    dbPlans.forEach(plan => {
+      plansList.push({
+        id: plan.id,
+        name: plan.name,
+        monthlyPrice: plan.monthlyPrice,
+        currency: plan.currency || '$',
+        maxEmployees: plan.maxEmployees,
+        isPopular: plan.isPopular
+      });
+
+      const assigned = plan.features.map(f => f.feature);
+      if (assigned.length > 0) {
+        plansFeaturesMap[plan.name] = assigned;
+      } else {
+        const lower = plan.name.toLowerCase();
+        if (lower.includes('enterprise') || lower.includes('unlimited')) {
+          plansFeaturesMap[plan.name] = STANDARD_MODULE_FEATURES.map(f => f.id);
+        } else if (lower.includes('pro') || lower.includes('growth') || lower.includes('demanded')) {
+          plansFeaturesMap[plan.name] = ['attendance_leave', 'employee_directory', 'payroll_operations', 'recruitment_pipeline', 'benefits_insurance', 'performance_kpi', 'approval_workflows', 'audit_compliance'];
+        } else {
+          plansFeaturesMap[plan.name] = ['attendance_leave', 'employee_directory', 'performance_kpi'];
+        }
+      }
+    });
+
     return res.status(200).json({
       success: true,
-      data: cachedFeatureConfig || DEFAULT_FEATURE_TIERS
+      data: {
+        features: STANDARD_MODULE_FEATURES,
+        plans: plansFeaturesMap,
+        plansList: plansList.length > 0 ? plansList : [
+          { id: '1', name: 'Starter', monthlyPrice: 15, currency: '$', maxEmployees: 15 },
+          { id: '2', name: 'Professional', monthlyPrice: 39, currency: '$', maxEmployees: 100 },
+          { id: '3', name: 'Enterprise', monthlyPrice: 99, currency: '$', maxEmployees: 9999 }
+        ]
+      }
     });
   } catch (err) { next(err); }
 };
@@ -1716,26 +2106,61 @@ const getPlatformFeatures = async (req, res, next) => {
 const updatePlatformFeatures = async (req, res, next) => {
   try {
     const { plans } = req.body;
-    if (plans) {
-      cachedFeatureConfig = {
-        ...DEFAULT_FEATURE_TIERS,
-        plans: {
-          ...DEFAULT_FEATURE_TIERS.plans,
-          ...plans
-        }
-      };
+    if (!plans || typeof plans !== 'object') {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_DATA', message: 'Plans object is required.' }
+      });
     }
+
+    // Persist to Prisma PricingFeature table for each plan
+    for (const [planName, featureIds] of Object.entries(plans)) {
+      if (Array.isArray(featureIds)) {
+        const plan = await prisma.pricingPlan.findFirst({
+          where: { OR: [{ name: planName }, { id: planName }] }
+        });
+
+        if (plan) {
+          // Delete old feature mappings for this plan
+          await prisma.pricingFeature.deleteMany({
+            where: { pricingPlanId: plan.id }
+          });
+
+          // Insert new feature mappings
+          if (featureIds.length > 0) {
+            await prisma.pricingFeature.createMany({
+              data: featureIds.map((feat, idx) => ({
+                pricingPlanId: plan.id,
+                feature: feat,
+                displayOrder: idx
+              }))
+            });
+          }
+        }
+      }
+    }
+
+    if (req.user) {
+      await prisma.auditLog.create({
+        data: {
+          userId: req.user.userId,
+          action: 'UPDATE_FEATURE_ENTITLEMENTS',
+          details: `Updated SaaS feature matrix for plans: ${Object.keys(plans).join(', ')}`,
+          ipAddress: req.ip || req.socket.remoteAddress
+        }
+      });
+    }
+
     return res.status(200).json({
       success: true,
-      data: cachedFeatureConfig || DEFAULT_FEATURE_TIERS,
-      message: 'Plan feature entitlements updated successfully.'
+      message: 'Plan feature entitlements saved permanently to the database.'
     });
   } catch (err) { next(err); }
 };
 
 module.exports = {
   getPlatformStats,
-  getAllOrganizations, createOrganization, deleteOrganization, updateOrgSubscription,
+  getAllOrganizations, getOrganizationDetails, provisionOrganization, suspendOrganization, activateOrganization, createOrganization, deleteOrganization, updateOrgSubscription,
   getAllPlatformUsers, createAdminForOrg,
   toggleAnyUserActive, changeAnyUserRole, revokeAnyUserRole,
   getPlatformAuditLogs,

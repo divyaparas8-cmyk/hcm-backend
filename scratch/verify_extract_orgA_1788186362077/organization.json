@@ -1,0 +1,29 @@
+{
+  "profile": {
+    "id": "3b82ade8-19a3-4434-8029-7183d28a6877",
+    "name": "GlobalTech Solutions",
+    "legalName": "GlobalTech Solutions Inc.",
+    "websiteUrl": null,
+    "industry": null,
+    "companySize": null,
+    "logoUrl": "https://res.cloudinary.com/lojyivli/image/upload/v1788184178/hcm/logos/ys4gxqwq8vmwon2ff7qr.jpg",
+    "address": null,
+    "taxId": null,
+    "primaryEmail": null,
+    "supportPhone": null,
+    "phone": null,
+    "email": null,
+    "timezone": null,
+    "currency": null,
+    "status": "ACTIVE",
+    "subscriptionStatus": "TRIAL",
+    "subscriptionStart": null,
+    "subscriptionEnd": null,
+    "createdAt": "2026-08-22T06:39:46.006Z",
+    "updatedAt": "2026-08-31T13:49:39.487Z",
+    "pricingPlanId": null,
+    "pricingPlan": null
+  },
+  "attendancePolicy": null,
+  "payrollConfig": null
+}

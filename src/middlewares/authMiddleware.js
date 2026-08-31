@@ -26,6 +26,7 @@ const protect = async (req, res, next) => {
     const user = await prisma.user.findUnique({ 
       where: { id: decoded.userId },
       include: {
+        organization: true,
         customRole: {
           select: {
             id: true,
@@ -41,6 +42,20 @@ const protect = async (req, res, next) => {
         success: false,
         error: { code: 'INVALID_TOKEN', message: 'User does not exist or was deleted.' },
       });
+    }
+
+    // Check Organization active status (SuperAdmin is exempt)
+    if (user.role !== 'SUPERADMIN' && user.organization) {
+      const orgStatus = (user.organization.status || 'ACTIVE').toUpperCase();
+      if (orgStatus === 'SUSPENDED' || orgStatus === 'INACTIVE' || orgStatus === 'DEACTIVATED') {
+        return res.status(403).json({
+          success: false,
+          error: {
+            code: 'ORGANIZATION_DEACTIVATED',
+            message: 'Your organization account is currently deactivated. Access is restricted.'
+          }
+        });
+      }
     }
 
     // Decoded info ko req mein attach karo taaki controller use kar sake

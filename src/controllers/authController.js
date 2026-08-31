@@ -38,10 +38,13 @@ const login = async (req, res, next) => {
 
     const { email, password } = parsed.data;
 
-    // 2. User ko DB mein dhundo
+    // 2. User ko DB mein dhundo with organization info
     const user = await prisma.user.findUnique({ 
       where: { email },
-      include: { customRole: { select: { status: true, landingPage: true, inheritsFrom: true } } }
+      include: {
+        organization: true,
+        customRole: { select: { status: true, landingPage: true, inheritsFrom: true } }
+      }
     });
     if (!user) {
       return res.status(401).json({
@@ -55,6 +58,20 @@ const login = async (req, res, next) => {
         success: false,
         error: { code: 'ACCOUNT_SUSPENDED', message: 'Your account is suspended. Please contact support.' },
       });
+    }
+
+    // Tenant Status Check: Non-superadmins cannot log in if organization is deactivated/suspended
+    if (user.role !== 'SUPERADMIN' && user.organization) {
+      const orgStatus = (user.organization.status || 'ACTIVE').toUpperCase();
+      if (orgStatus === 'SUSPENDED' || orgStatus === 'INACTIVE' || orgStatus === 'DEACTIVATED') {
+        return res.status(403).json({
+          success: false,
+          error: {
+            code: 'ORGANIZATION_DEACTIVATED',
+            message: 'Your organization account is currently deactivated. Access is restricted. Please contact your system administrator.'
+          },
+        });
+      }
     }
 
     // 3. Password check karo (bcrypt compare)
@@ -85,15 +102,15 @@ const login = async (req, res, next) => {
       organizationId: user.organizationId,
     });
 
-    // Log login action
-    await prisma.auditLog.create({
+    // Log login action (non-blocking)
+    prisma.auditLog.create({
       data: {
         userId: user.id,
         action: 'USER_LOGIN',
         details: `User logged in successfully`,
         ipAddress: req.ip || req.socket.remoteAddress
       }
-    });
+    }).catch(err => console.warn('[Auth] Non-critical audit log skipped:', err.message));
 
     // Determine effective role for frontend to redirect properly
     const effectiveRole = (user.customRole && user.customRole.status === 'ACTIVE') 

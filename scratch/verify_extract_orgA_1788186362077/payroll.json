@@ -1,0 +1,26 @@
+{
+  "structures": [],
+  "components": [],
+  "deductions": [],
+  "taxRules": [],
+  "bands": [],
+  "payslips": [
+    {
+      "id": "e0d049c8-7eb2-4404-ac16-490a2b92343a",
+      "employeeId": "3cb41d4b-bccb-4956-8d3e-f009fadc8816",
+      "month": "June",
+      "basic": 6000,
+      "hra": 1200,
+      "allowance": 500,
+      "bonus": 300,
+      "pf": 400,
+      "tax": 300,
+      "netPay": 7300,
+      "status": "Paid",
+      "paymentDate": "2026-08-22T06:39:46.147Z",
+      "currency": "USD",
+      "createdAt": "2026-08-22T06:39:46.148Z"
+    }
+  ],
+  "snapshots": []
+}

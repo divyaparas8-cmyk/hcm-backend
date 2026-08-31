@@ -1,0 +1,50 @@
+{
+  "policies": [],
+  "requests": [
+    {
+      "id": "7452e1e1-e587-4a27-ae50-44ac9c9f67d8",
+      "userId": "c1017bd6-5cae-458f-a430-439127049325",
+      "leaveType": "Annual Leave",
+      "startDate": "2026-08-27T00:00:00.000Z",
+      "endDate": "2026-09-01T00:00:00.000Z",
+      "totalDays": 5,
+      "reason": "Family vacation and relaxation.",
+      "status": "PENDING",
+      "managerComment": null,
+      "emergencyContact": null,
+      "attachmentName": null,
+      "attachmentUrl": null,
+      "createdAt": "2026-08-22T06:39:46.146Z"
+    },
+    {
+      "id": "ac25acb0-d720-4ffc-b1a5-65c5cb57b365",
+      "userId": "c1017bd6-5cae-458f-a430-439127049325",
+      "leaveType": "Sick Leave",
+      "startDate": "2026-09-01T00:00:00.000Z",
+      "endDate": "2026-09-02T00:00:00.000Z",
+      "totalDays": 2,
+      "reason": "Medical checkup with specialist",
+      "status": "PENDING",
+      "managerComment": null,
+      "emergencyContact": null,
+      "attachmentName": "medical_report.pdf",
+      "attachmentUrl": "https://ik.imagekit.io/hcmkiaan/hcm/leaves/medical_report.pdf",
+      "createdAt": "2026-08-25T07:50:10.400Z"
+    },
+    {
+      "id": "cba3610b-fb61-42ab-b89b-eea9daa076e2",
+      "userId": "c1017bd6-5cae-458f-a430-439127049325",
+      "leaveType": "Sick Leave",
+      "startDate": "2026-09-01T00:00:00.000Z",
+      "endDate": "2026-09-02T00:00:00.000Z",
+      "totalDays": 2,
+      "reason": "Medical checkup with specialist",
+      "status": "PENDING",
+      "managerComment": null,
+      "emergencyContact": null,
+      "attachmentName": "medical_report.pdf",
+      "attachmentUrl": "https://ik.imagekit.io/hcmkiaan/hcm/leaves/medical_report.pdf",
+      "createdAt": "2026-08-25T07:50:51.314Z"
+    }
+  ]
+}

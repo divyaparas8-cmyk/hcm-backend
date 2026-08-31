@@ -1,0 +1,27 @@
+{
+  "goals": [
+    {
+      "id": "ff37ef83-785e-4acd-8203-8994d8ab15fb",
+      "employeeId": "3cb41d4b-bccb-4956-8d3e-f009fadc8816",
+      "title": "Complete React 19 Upgrade",
+      "progress": 60,
+      "priority": "High",
+      "deadline": "2026-09-30T00:00:00.000Z",
+      "createdAt": "2026-08-22T06:39:46.154Z",
+      "updatedAt": "2026-08-22T06:39:46.154Z"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "fd1163c0-694f-4979-aa6c-a17605459e3e",
+      "employeeId": "3cb41d4b-bccb-4956-8d3e-f009fadc8816",
+      "title": "Debug Login Session Redirects",
+      "description": "Analyze axios 401 response handling and verify fallback modes.",
+      "status": "Pending",
+      "priority": "High",
+      "dueDate": "2026-08-24T06:39:46.155Z",
+      "createdAt": "2026-08-22T06:39:46.156Z",
+      "updatedAt": "2026-08-22T06:39:46.156Z"
+    }
+  ]
+}

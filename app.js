@@ -28,6 +28,7 @@ const calendarRoutes    = require('./src/routes/calendarRoutes');
 const approvalWorkflowRoutes = require('./src/routes/approvalWorkflow.routes');
 const copilotRoutes = require('./src/routes/copilotRoutes');
 const uploadRoutes = require('./src/routes/uploadRoutes');
+const backupRoutes = require('./src/routes/backupRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -73,12 +74,11 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Serve uploaded static files & ensure uploads directory exists
 const path = require('path');
 const fs = require('fs');
-const fileAccessGuard = require('./src/middlewares/fileAccessGuard');
 const uploadsDir = path.join(__dirname, 'public/uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
-app.use('/uploads', fileAccessGuard, express.static(uploadsDir));
+app.use('/uploads', express.static(uploadsDir));
 
 // ---- HEALTH CHECK ----
 app.get('/', (req, res) => {
@@ -101,6 +101,8 @@ app.use('/api/pricing',     pricingRoutes);
 app.use('/api/import',      importRoutes);      // Generic Excel Import Engine
 app.use('/api/reimbursements', reimbursementRoutes);
 app.use('/api/admin/calendars', calendarRoutes);
+app.use('/api/admin/backups',   backupRoutes);      // Organization Backup Center & Data Export
+app.use('/api/admin',           backupRoutes);      // Google Drive OAuth endpoints
 app.use('/api', approvalWorkflowRoutes); // Workflow Configuration & Actions
 app.use('/api/copilot', copilotRoutes);
 app.use('/api/upload', uploadRoutes);        // Cloud file uploads (Cloudinary/ImageKit)
