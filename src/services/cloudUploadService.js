@@ -6,6 +6,7 @@
 // storage if cloud credentials are not configured.
 // ============================================================
 
+require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -21,25 +22,31 @@ if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+const cleanEnv = (val) => (val ? String(val).replace(/^["']|["']$/g, '').trim() : '');
+
 // ── Initialize Cloudinary ──
 function getCloudinary() {
   if (cloudinaryClient) return cloudinaryClient;
 
-  const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
-  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+  const cloudName = cleanEnv(process.env.CLOUDINARY_CLOUD_NAME);
+  const apiKey = cleanEnv(process.env.CLOUDINARY_API_KEY);
+  const apiSecret = cleanEnv(process.env.CLOUDINARY_API_SECRET);
+
+  if (!cloudName || !apiKey || !apiSecret) {
+    console.warn('[CloudUpload] Cloudinary credentials missing in .env');
     return null;
   }
 
   try {
     const cloudinary = require('cloudinary').v2;
     cloudinary.config({
-      cloud_name: CLOUDINARY_CLOUD_NAME,
-      api_key: CLOUDINARY_API_KEY,
-      api_secret: CLOUDINARY_API_SECRET,
+      cloud_name: cloudName,
+      api_key: apiKey,
+      api_secret: apiSecret,
       secure: true,
     });
     cloudinaryClient = cloudinary;
-    console.log('[CloudUpload] Cloudinary initialized successfully');
+    console.log('[CloudUpload] Cloudinary initialized successfully for cloud:', cloudName);
     return cloudinaryClient;
   } catch (err) {
     console.warn('[CloudUpload] Failed to initialize Cloudinary:', err.message);
@@ -48,22 +55,38 @@ function getCloudinary() {
 }
 
 // ── Initialize ImageKit ──
+// @imagekit/nodejs v7+ only requires privateKey for server-side operations.
+// publicKey and urlEndpoint are optional (used for URL generation helpers).
 function getImageKit() {
   if (imagekitClient) return imagekitClient;
 
-  const { IMAGEKIT_PUBLIC_KEY, IMAGEKIT_PRIVATE_KEY, IMAGEKIT_URL_ENDPOINT } = process.env;
-  if (!IMAGEKIT_PUBLIC_KEY || !IMAGEKIT_PRIVATE_KEY || !IMAGEKIT_URL_ENDPOINT) {
+  const privateKey = cleanEnv(process.env.IMAGEKIT_PRIVATE_KEY);
+  const urlEndpoint = cleanEnv(process.env.IMAGEKIT_URL_ENDPOINT);
+
+  // Log safe config info (never log the actual private key)
+  console.log('[IMAGEKIT CONFIG]', {
+    hasPublicKey: Boolean(cleanEnv(process.env.IMAGEKIT_PUBLIC_KEY)),
+    hasPrivateKey: Boolean(privateKey),
+    hasUrlEndpoint: Boolean(urlEndpoint),
+    endpoint: urlEndpoint || '(not set)',
+  });
+
+  if (!privateKey) {
+    console.warn('[CloudUpload] ImageKit PRIVATE_KEY missing in .env — uploads will fall back to local storage');
     return null;
   }
 
   try {
-    const ImageKit = require('@imagekit/nodejs').default || require('@imagekit/nodejs');
+    const ImageKitModule = require('@imagekit/nodejs');
+    const ImageKit = ImageKitModule.default || ImageKitModule;
     imagekitClient = new ImageKit({
-      publicKey: IMAGEKIT_PUBLIC_KEY,
-      privateKey: IMAGEKIT_PRIVATE_KEY,
-      urlEndpoint: IMAGEKIT_URL_ENDPOINT,
+      privateKey: privateKey,
+      // SDK v7 has built-in retries (default 2). We increase to 3 for resilience.
+      maxRetries: 3,
+      // 30-second timeout (default is 60s) — fail fast on stuck connections
+      timeout: 30 * 1000,
     });
-    console.log('[CloudUpload] ImageKit initialized successfully');
+    console.log('[CloudUpload] ImageKit v7 initialized successfully (endpoint:', urlEndpoint || 'default', ')');
     return imagekitClient;
   } catch (err) {
     console.warn('[CloudUpload] Failed to initialize ImageKit:', err.message);
@@ -171,15 +194,17 @@ async function uploadImage(input, options = {}) {
   const cloudinary = getCloudinary();
   if (cloudinary) {
     try {
+      const uploadOptions = {
+        folder,
+        resource_type: 'image',
+      };
+      if (parsed.mimeType && parsed.mimeType !== 'image/svg+xml') {
+        uploadOptions.transformation = [{ quality: 'auto', fetch_format: 'auto' }];
+      }
+
       const result = await cloudinary.uploader.upload(
-        `data:${parsed.mimeType};base64,${parsed.base64Data}`,
-        {
-          folder,
-          resource_type: 'image',
-          transformation: [
-            { quality: 'auto', fetch_format: 'auto' },
-          ],
-        }
+        `data:${parsed.mimeType || 'image/png'};base64,${parsed.base64Data}`,
+        uploadOptions
       );
 
       console.log(`[CloudUpload] Image uploaded to Cloudinary: ${result.secure_url}`);
@@ -203,6 +228,12 @@ async function uploadImage(input, options = {}) {
 // Accepts: base64 data URL string, or { buffer, originalname, mimetype }
 // Options: { folder: 'hcm/resumes', filenamePrefix: 'resume' }
 // Returns: { url, fileId, provider }
+//
+// SDK v7 notes:
+//   - Use client.files.upload({ file, fileName, ... })
+//   - `file` must be ReadStream | File | Response | toFile() result
+//   - Raw base64 strings are NOT accepted as `file`
+//   - SDK has built-in retry (maxRetries: 3) for ECONNRESET, 429, 5xx
 // ============================================================
 async function uploadDocument(input, options = {}) {
   const { folder = 'hcm/documents', filenamePrefix = 'document' } = options;
@@ -224,27 +255,48 @@ async function uploadDocument(input, options = {}) {
       buffer: input.buffer,
       mimeType: input.mimetype,
       extension: getExtensionFromMime(input.mimetype),
-      base64Data: input.buffer.toString('base64'),
     };
     originalName = input.originalname || originalName;
   } else {
     throw new Error('Invalid input for uploadDocument');
   }
 
-  // Try ImageKit
+  // ── Validate file buffer ──
+  console.log('[IMAGEKIT INPUT]', {
+    fileName: originalName,
+    mimeType: parsed.mimeType,
+    hasBuffer: Boolean(parsed.buffer),
+    bufferLength: parsed.buffer?.length,
+  });
+
+  if (!parsed.buffer || parsed.buffer.length === 0) {
+    const err = new Error('File buffer is missing or empty — cannot upload');
+    err.status = 400;
+    throw err;
+  }
+
+  // ── Try ImageKit ──
   const imagekit = getImageKit();
   if (imagekit) {
     try {
-      const uploadParams = {
-        file: parsed.base64Data, // base64 string (without data: prefix)
+      // SDK v7 requires toFile() to convert a Buffer into an uploadable object
+      const { toFile } = require('@imagekit/nodejs');
+      const uploadableFile = await toFile(parsed.buffer, originalName);
+
+      console.log(`[IMAGEKIT] uploading "${originalName}" (${parsed.buffer.length} bytes) to folder "${folder}"...`);
+
+      const result = await imagekit.files.upload({
+        file: uploadableFile,
         fileName: originalName,
         folder,
         useUniqueFileName: true,
-      };
+      });
 
-      const result = imagekit.files?.upload
-        ? await imagekit.files.upload(uploadParams)
-        : await imagekit.upload(uploadParams);
+      // ── Validate the returned URL ──
+      if (!result?.url) {
+        console.error('[IMAGEKIT UPLOAD] SDK returned success but no URL:', JSON.stringify(result));
+        throw new Error('ImageKit upload returned no URL');
+      }
 
       console.log(`[CloudUpload] Document uploaded to ImageKit: ${result.url}`);
       return {
@@ -253,9 +305,23 @@ async function uploadDocument(input, options = {}) {
         provider: 'imagekit',
       };
     } catch (err) {
-      console.error('[CloudUpload] ImageKit upload failed, falling back to local:', err.message);
+      // ── Capture the complete SDK error (no secrets) ──
+      console.error('[IMAGEKIT UPLOAD FAILED]', {
+        name: err?.name,
+        message: err?.message,
+        code: err?.code,
+        statusCode: err?.statusCode || err?.status,
+        responseStatus: err?.response?.status,
+        responseData: err?.response?.data,
+        cause: err?.cause?.message || err?.cause,
+      });
+
+      console.warn('[CloudUpload] ImageKit upload failed, falling back to local disk storage:', err.message);
     }
   }
+
+  // Fallback to local disk storage
+  return saveToLocal(parsed, filenamePrefix);
 
   // Fallback to local
   const localResult = saveToLocal(parsed, filenamePrefix);
@@ -364,6 +430,7 @@ module.exports = {
   uploadImage,
   uploadDocument,
   smartUpload,
+  saveToLocal,
   deleteImage,
   deleteDocument,
   handleBase64Field,

@@ -2,8 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { getSalaryStructures, getSalaryStructureById, createSalaryStructure, updateSalaryStructure, deleteSalaryStructure, updateStructureVersionComponents } = require('../controllers/salaryStructureController');
 const { protect, authorize } = require('../middlewares/authMiddleware');
+const tenantGuard = require('../middlewares/tenantGuard');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 
 router.use(protect);
+router.use(tenantGuard);
 // We'll require ADMIN or HR or SUPERADMIN for payroll config
 router.use(authorize('SUPERADMIN', 'ADMIN', 'HR'));
 

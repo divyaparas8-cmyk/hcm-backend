@@ -3,7 +3,8 @@
 // ============================================================
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middlewares/authMiddleware');
+const { protect, tenantGuard, authorize } = require('../middlewares/authMiddleware');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 const { checkPermission } = require('../middlewares/permissionMiddleware');
 
 const {
@@ -23,7 +24,7 @@ const {
 router.get('/jobs', getAvailableJobs);
 
 // Protected - Only CANDIDATE
-router.use(protect, authorize('CANDIDATE'));
+router.use(protect, tenantGuard, authorize('CANDIDATE'));
 router.post('/jobs/:jobId/apply', checkPermission('browse_jobs', 'create'), applyToJob);
 router.get('/applications', checkPermission('my_applications', 'view'), getMyApplications);
 router.delete('/applications/:appId', checkPermission('my_applications', 'delete'), withdrawApplication);

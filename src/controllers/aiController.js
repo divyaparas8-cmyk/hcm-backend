@@ -71,7 +71,7 @@ const aiPolicyAssistant = async (req, res, next) => {
 // GET /api/manager/ai/attendance-insights
 const aiAttendanceInsights = async (req, res, next) => {
   try {
-    const orgId = req.user?.organizationId || (await prisma.organization.findFirst({ select: { id: true } }))?.id;
+    const orgId = req.user.organizationId;
     
     let whereClause = {};
     if (req.user?.role && !['ADMIN', 'SUPERADMIN', 'HR'].includes(req.user.role)) {

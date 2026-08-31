@@ -110,4 +110,6 @@ const authorize = (...allowedRoles) => {
   };
 };
 
-module.exports = { protect, authorize };
+const tenantGuard = require('./tenantGuard');
+
+module.exports = { protect, authorize, tenantGuard };

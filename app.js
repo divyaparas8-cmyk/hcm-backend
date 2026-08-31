@@ -30,7 +30,7 @@ const copilotRoutes = require('./src/routes/copilotRoutes');
 const uploadRoutes = require('./src/routes/uploadRoutes');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 // ---- GLOBAL MIDDLEWARES ----
 
@@ -62,6 +62,10 @@ app.use(cors({
   credentials: true,
 }));
 
+// Rate limiting – apply after CORS so blocked requests still get CORS headers
+const rateLimiter = require('./src/middlewares/rateLimiter');
+app.use(rateLimiter);
+
 // JSON body parser: request body ko parse karne ke liye (increased limit for base64 resumes)
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
@@ -69,11 +73,12 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Serve uploaded static files & ensure uploads directory exists
 const path = require('path');
 const fs = require('fs');
+const fileAccessGuard = require('./src/middlewares/fileAccessGuard');
 const uploadsDir = path.join(__dirname, 'public/uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
-app.use('/uploads', express.static(uploadsDir));
+app.use('/uploads', fileAccessGuard, express.static(uploadsDir));
 
 // ---- HEALTH CHECK ----
 app.get('/', (req, res) => {

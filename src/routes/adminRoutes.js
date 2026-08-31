@@ -3,7 +3,8 @@
 // ============================================================
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middlewares/authMiddleware');
+const { protect, tenantGuard, authorize } = require('../middlewares/authMiddleware');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 const { checkPermission } = require('../middlewares/permissionMiddleware');
 
 const multer = require('multer');
@@ -52,7 +53,7 @@ const {
 const { getOrgChart } = require('../controllers/orgChartController');
 
 // Base authentication & platform role check
-router.use(protect, authorize('ADMIN', 'SUPERADMIN', 'HR'));
+router.use(protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'));
 
 // Dashboard Stats
 router.get('/stats', checkPermission('dashboard', 'view'), getDashboardStats);
@@ -77,7 +78,7 @@ router.get('/org-chart', checkPermission('departments', 'view'), getOrgChart);
 
 // Users
 router.get('/users', checkPermission('users', 'view'), getAllUsers);
-router.post('/users', checkPermission('users', 'create'), createUser);
+router.post('/users', checkPermission('users', 'create'), subscriptionGuard('ADD_EMPLOYEE'), createUser);
 router.put('/users/:id', checkPermission('users', 'edit'), updateUser);
 router.patch('/users/:id/role', checkPermission('users', 'edit'), changeUserRole);
 router.post('/users/:id/revoke-role', checkPermission('users', 'edit'), revokeUserRole);

@@ -3,9 +3,12 @@ const router = express.Router();
 const approvalWorkflowController = require('../controllers/approvalWorkflow.controller');
 const { verifyApprover } = require('../middlewares/approval.middleware');
 const { protect } = require('../middlewares/authMiddleware');
+const tenantGuard = require('../middlewares/tenantGuard');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 
 // Require authentication for all workflow routes
 router.use(protect);
+router.use(tenantGuard);
 
 // ─────────────────────────────────────────
 // Workflow Configuration Routes (Typically Admin/HR only)

@@ -91,17 +91,12 @@ const updateSettings = async (req, res, next) => {
 // GET /api/settings/master-currency
 const getMasterCurrency = async (req, res, next) => {
   try {
-    let settings = await prisma.globalSettings.findUnique({
+    const settings = await prisma.globalSettings.upsert({
       where: { id: 'global-settings' },
+      update: {}, // no changes needed on existing record
+      create: defaultSettings,
       select: { masterCurrency: true }
     });
-
-    if (!settings) {
-      settings = await prisma.globalSettings.create({
-        data: defaultSettings,
-        select: { masterCurrency: true }
-      });
-    }
 
     return res.status(200).json({ success: true, data: { currency: settings.masterCurrency } });
   } catch (error) {

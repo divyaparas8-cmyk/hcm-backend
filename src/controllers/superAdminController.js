@@ -1600,6 +1600,139 @@ const updateSystemSettings = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+// ─────────────────────────────────────────
+// GLOBAL USAGE ANALYTICS  →  GET /api/superadmin/usage
+// ─────────────────────────────────────────
+const getGlobalUsage = async (req, res, next) => {
+  try {
+    const [organizations, totalUsers, totalEmployees, totalAiLogs, totalDocs] = await Promise.all([
+      prisma.organization.findMany({
+        include: {
+          pricingPlan: true,
+          _count: {
+            select: {
+              users: true,
+              employeeProfiles: true,
+            }
+          }
+        },
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.user.count(),
+      prisma.employeeProfile.count(),
+      prisma.aiLog.count(),
+      prisma.employeeDocument ? prisma.employeeDocument.count().catch(() => 0) : 0
+    ]);
+
+    let totalAllocatedSeats = 0;
+    let totalStorageUsedGB = 0;
+    let totalMaxStorageGB = 0;
+
+    const tenantBreakdown = organizations.map(org => {
+      const seatLimit = org.maxEmployees || org.pricingPlan?.maxEmployees || 50;
+      const currentEmployees = org._count?.employeeProfiles || 0;
+      const storageLimit = org.maxStorageGB || org.pricingPlan?.maxStorageGB || 20;
+      
+      // Estimated storage based on employee profile & document count
+      const estimatedStorageGB = Math.max(0.5, Number(((currentEmployees * 0.08) + 0.2).toFixed(2)));
+      
+      totalAllocatedSeats += seatLimit;
+      totalStorageUsedGB += estimatedStorageGB;
+      totalMaxStorageGB += storageLimit;
+
+      return {
+        id: org.id,
+        name: org.name,
+        slug: org.slug,
+        plan: org.plan || org.pricingPlan?.name || 'Professional',
+        status: org.status || 'Active',
+        currentEmployees,
+        maxEmployees: seatLimit,
+        seatUtilizationPct: Math.min(100, Math.round((currentEmployees / (seatLimit || 1)) * 100)),
+        storageUsedGB: estimatedStorageGB,
+        maxStorageGB: storageLimit,
+        storageUtilizationPct: Math.min(100, Math.round((estimatedStorageGB / (storageLimit || 1)) * 100)),
+        totalUsers: org._count?.users || 0,
+        createdAt: org.createdAt
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        summary: {
+          totalOrganizations: organizations.length,
+          activeOrganizations: organizations.filter(o => (o.status || '').toLowerCase() === 'active').length,
+          trialOrganizations: organizations.filter(o => (o.status || '').toLowerCase() === 'trial' || (o.plan || '').toLowerCase() === 'trial').length,
+          suspendedOrganizations: organizations.filter(o => (o.status || '').toLowerCase() === 'suspended').length,
+          totalEmployees,
+          totalAllocatedSeats,
+          totalUsers,
+          totalStorageUsedGB: Number(totalStorageUsedGB.toFixed(2)),
+          totalMaxStorageGB,
+          totalAiRequests: totalAiLogs,
+          totalDocuments: totalDocs
+        },
+        tenants: tenantBreakdown
+      }
+    });
+  } catch (err) { next(err); }
+};
+
+// ─────────────────────────────────────────
+// PLATFORM FEATURE MANAGEMENT  →  GET /api/superadmin/features
+// ─────────────────────────────────────────
+const DEFAULT_FEATURE_TIERS = {
+  features: [
+    { id: 'attendance_leave', name: 'Attendance & Leave Tracking', category: 'Core HR', description: 'Web clock-in/out, timesheets, and leave management' },
+    { id: 'employee_directory', name: 'Employee Directory & Profiles', category: 'Core HR', description: 'Centralized employee records, docs, and org charts' },
+    { id: 'payroll_operations', name: 'Payroll & Compensation', category: 'Payroll', description: 'Salary components, deductions, tax brackets & pay runs' },
+    { id: 'recruitment_pipeline', name: 'Recruitment & Job Pipeline', category: 'Recruitment', description: 'Job posts, Kanban candidate funnel, and offer letters' },
+    { id: 'ai_resume_scoring', name: 'AI Resume Scoring & Matching', category: 'AI & Automation', description: 'Automated resume analysis, scoring, and matching' },
+    { id: 'benefits_insurance', name: 'Benefits & Insurance Config', category: 'Benefits', description: 'Employee insurance schemes and wellness allowances' },
+    { id: 'performance_kpi', name: 'Performance & KPI Tracking', category: 'Performance', description: '1-on-1 reviews, objectives, and KPI targets' },
+    { id: 'approval_workflows', name: 'Custom Approval Workflows', category: 'Automation', description: 'Multi-level approval chains for leaves & expenses' },
+    { id: 'advanced_reports', name: 'Advanced Analytics & Exports', category: 'Analytics', description: 'Custom report builder and scheduled automated exports' },
+    { id: 'audit_compliance', name: 'Audit Logs & Statutory Compliance', category: 'Security', description: 'Granular audit logs and compliance policy center' }
+  ],
+  plans: {
+    Starter: ['attendance_leave', 'employee_directory', 'performance_kpi'],
+    Professional: ['attendance_leave', 'employee_directory', 'payroll_operations', 'recruitment_pipeline', 'benefits_insurance', 'performance_kpi', 'approval_workflows', 'audit_compliance'],
+    Enterprise: ['attendance_leave', 'employee_directory', 'payroll_operations', 'recruitment_pipeline', 'ai_resume_scoring', 'benefits_insurance', 'performance_kpi', 'approval_workflows', 'advanced_reports', 'audit_compliance']
+  }
+};
+
+let cachedFeatureConfig = null;
+
+const getPlatformFeatures = async (req, res, next) => {
+  try {
+    return res.status(200).json({
+      success: true,
+      data: cachedFeatureConfig || DEFAULT_FEATURE_TIERS
+    });
+  } catch (err) { next(err); }
+};
+
+const updatePlatformFeatures = async (req, res, next) => {
+  try {
+    const { plans } = req.body;
+    if (plans) {
+      cachedFeatureConfig = {
+        ...DEFAULT_FEATURE_TIERS,
+        plans: {
+          ...DEFAULT_FEATURE_TIERS.plans,
+          ...plans
+        }
+      };
+    }
+    return res.status(200).json({
+      success: true,
+      data: cachedFeatureConfig || DEFAULT_FEATURE_TIERS,
+      message: 'Plan feature entitlements updated successfully.'
+    });
+  } catch (err) { next(err); }
+};
+
 module.exports = {
   getPlatformStats,
   getAllOrganizations, createOrganization, deleteOrganization, updateOrgSubscription,
@@ -1614,5 +1747,8 @@ module.exports = {
   getPayrollSettings, updatePayrollSettings,
   getPayrollHistory, createPayslip, updatePayslip, deletePayslip, bulkApprovePayslips, generatePayroll,
   resetUserPassword,
-  getSystemSettings, updateSystemSettings
+  getSystemSettings, updateSystemSettings,
+  getGlobalUsage,
+  getPlatformFeatures,
+  updatePlatformFeatures
 };

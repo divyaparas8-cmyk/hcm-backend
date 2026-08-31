@@ -157,7 +157,8 @@ const getDashboardStats = async (req, res, next) => {
 // GET /api/admin/organization
 const getOrganization = async (req, res, next) => {
   try {
-    const org = await prisma.organization.findFirst();
+    const orgId = req.user?.organizationId;
+    const org = await prisma.organization.findUnique({ where: { id: orgId } });
     if (org) {
       org.setupComplete = true;
     }
@@ -228,7 +229,8 @@ const updateOrganizationLogo = async (req, res, next) => {
       return res.status(400).json({ success: false, error: { message: 'No logo file or URL provided.' } });
     }
 
-    let org = await prisma.organization.findFirst();
+    const orgId = req.user?.organizationId;
+    let org = await prisma.organization.findUnique({ where: { id: orgId } });
     if (!org) {
       org = await prisma.organization.create({
         data: { name: 'Organization', logoUrl }
@@ -257,9 +259,10 @@ const updateOrganizationLogo = async (req, res, next) => {
 // DELETE /api/admin/organization/logo
 const deleteOrganizationLogo = async (req, res, next) => {
   try {
-    let org = await prisma.organization.findFirst();
+    const orgId = req.user?.organizationId;
+    let org = await prisma.organization.findUnique({ where: { id: orgId } });
     if (org) {
-      org = await prisma.organization.update({
+      await prisma.organization.update({
         where: { id: org.id },
         data: { logoUrl: null }
       });
@@ -364,7 +367,7 @@ const departmentSchema = z.object({
 
 const resolveOrganizationId = async (organizationId) => {
   if (organizationId) return organizationId;
-  const org = await prisma.organization.findFirst({ select: { id: true } });
+  
   return org?.id || null;
 };
 
@@ -512,11 +515,7 @@ const deleteDepartment = async (req, res, next) => {
 
 const getAllUsers = async (req, res, next) => {
   try {
-    let organizationId = req.user.organizationId;
-    if (!organizationId) {
-      const defaultOrg = await prisma.organization.findFirst({ select: { id: true } });
-      organizationId = defaultOrg?.id;
-    }
+    const organizationId = req.user.organizationId;
 
     if (!organizationId) {
       return res.status(200).json({ success: true, data: [], meta: { total: 0 } });
@@ -604,7 +603,7 @@ const createUser = async (req, res, next) => {
       return res.status(409).json({ success: false, error: { code: 'EMPID_TAKEN', message: 'Employee ID already exists.' } });
     }
 
-    const organizationId = req.user.organizationId || (await prisma.organization.findFirst({ select: { id: true } }))?.id || null;
+    const organizationId = req.user.organizationId;
     const department = await prisma.department.findFirst({
       where: {
         OR: [{ id: data.department }, { name: data.department }],
@@ -1441,11 +1440,7 @@ const getAuditLogs = async (req, res, next) => {
 
     const where = {};
 
-    let organizationId = req.user?.organizationId;
-    if (!organizationId) {
-      const defaultOrg = await prisma.organization.findFirst({ select: { id: true } });
-      organizationId = defaultOrg?.id;
-    }
+    const organizationId = req.user.organizationId;
 
     if (organizationId) {
       where.user = { organizationId };

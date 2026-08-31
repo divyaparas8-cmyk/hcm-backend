@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middlewares/authMiddleware');
+const tenantGuard = require('../middlewares/tenantGuard');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 const { checkPermission } = require('../middlewares/permissionMiddleware');
 
 const {
@@ -11,6 +13,7 @@ const {
 
 // All routes require authentication
 router.use(protect);
+router.use(tenantGuard);
 
 const { authorize } = require('../middlewares/authMiddleware');
 

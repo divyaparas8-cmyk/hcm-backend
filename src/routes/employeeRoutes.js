@@ -4,6 +4,8 @@
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middlewares/authMiddleware');
+const tenantGuard = require('../middlewares/tenantGuard');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 const { checkPermission } = require('../middlewares/permissionMiddleware');
 
 const {
@@ -25,6 +27,7 @@ const {
 
 // All routes require authentication
 router.use(protect);
+router.use(tenantGuard);
 
 // Profile
 router.get('/profile', checkPermission('profile', 'view'), getProfile);
@@ -97,7 +100,13 @@ const docUpload = multer({
 
 // Documents
 router.get('/documents', checkPermission('documents', 'view'), getDocuments);
-router.post('/documents', checkPermission('documents', 'create'), docUpload.single('file'), uploadDocument);
+router.post('/documents', checkPermission('documents', 'create'), (req, res, next) => {
+  console.log('[UPLOAD ROUTE HIT]', req.method, req.originalUrl);
+  next();
+}, docUpload.single('file'), (req, res, next) => {
+  console.log('[MULTER RESULT]', { file: req.file, body: req.body });
+  next();
+}, uploadDocument);
 router.delete('/documents/:id', checkPermission('documents', 'delete'), deleteDocument);
 
 // Compliance Policies

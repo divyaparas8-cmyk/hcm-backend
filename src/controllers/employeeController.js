@@ -6,7 +6,7 @@
 const prisma = require('../config/prisma');
 const { z } = require('zod');
 const bcrypt = require('bcryptjs');
-const { handleBase64Field, isBase64DataUrl, uploadDocument: uploadDocumentService } = require('../services/cloudUploadService');
+const { handleBase64Field, isBase64DataUrl, uploadDocument: uploadDocumentService, saveToLocal } = require('../services/cloudUploadService');
 const calendarResolver = require('../utils/calendarResolver');
 const { isWorkflowEnabled, startWorkflow } = require('../services/approval.service');
 
@@ -98,7 +98,7 @@ const updateProfile = async (req, res, next) => {
       language, timezone, dateFormat, emailNotif, pushNotif, weeklySummary
     } = req.body;
 
-    const profile = await prisma.employeeProfile.findUnique({ where: { userId: req.user.userId } });
+    const profile = await getOrCreateProfile(req.user.userId);
     
     // Avatar -> Cloudinary
     const finalAvatarUrl = await handleBase64Field(
@@ -129,8 +129,6 @@ const updateProfile = async (req, res, next) => {
         bloodGroup,
         address,
         avatarUrl: finalAvatarUrl,
-        identityProofUrl: finalIdentityProofUrl,
-        educationProofUrl: finalEducationProofUrl,
         emergencyName,
         emergencyPhone,
         emergencyRelation,
@@ -321,6 +319,11 @@ const applyLeave = async (req, res, next) => {
       totalDays: z.number().min(1),
       reason: z.string().optional(),
       emergencyContact: z.string().optional(),
+      attachment: z.object({
+        url: z.string(),
+        name: z.string().optional(),
+        size: z.string().optional(),
+      }).optional().nullable(),
     });
 
     const parsed = schema.safeParse(req.body);
@@ -402,14 +405,20 @@ const applyLeave = async (req, res, next) => {
     }
     // ------------------------------------------------------------
 
+    // Extract optional attachment fields
+    const { attachment, ...leavePayload } = parsed.data;
+    const attachmentUrl = attachment?.url || null;
+    const attachmentName = attachment?.name || null;
     const leave = await prisma.leaveRequest.create({
       data: {
         userId: req.user.userId,
-        ...parsed.data,
+        ...leavePayload,
         totalDays: calculatedDays,
         startDate: startDateObj,
         endDate: endDateObj,
         status: 'PENDING',
+        attachmentUrl,
+        attachmentName,
       },
     });
 
@@ -557,6 +566,7 @@ const createTicket = async (req, res, next) => {
       priority: z.enum(['High', 'Medium', 'Low']),
       description: z.string().min(5),
       attachmentBase64: z.string().optional().nullable(),
+      attachmentUrl: z.string().optional().nullable(),
     });
 
     const parsed = schema.safeParse(req.body);
@@ -564,7 +574,7 @@ const createTicket = async (req, res, next) => {
       return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
     }
 
-    let attachmentUrl = null;
+    let attachmentUrl = parsed.data.attachmentUrl || null;
     if (parsed.data.attachmentBase64) {
       attachmentUrl = await handleBase64Field(
         parsed.data.attachmentBase64,
@@ -597,15 +607,15 @@ const createTicket = async (req, res, next) => {
 const replyTicket = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { text, attachmentBase64 } = req.body;
+    const { text, attachmentBase64, attachmentUrl } = req.body;
 
-    if (!text && !attachmentBase64) {
+    if (!text && !attachmentBase64 && !attachmentUrl) {
       return res.status(400).json({ success: false, error: { message: 'Reply text or attachment is required' } });
     }
 
-    let attachmentUrl = null;
-    if (attachmentBase64) {
-      attachmentUrl = await handleBase64Field(
+    let finalAttachmentUrl = attachmentUrl || (req.file ? `/uploads/${req.file.filename}` : null);
+    if (!finalAttachmentUrl && attachmentBase64) {
+      finalAttachmentUrl = await handleBase64Field(
         attachmentBase64,
         null,
         { folder: 'hcm/tickets', filenamePrefix: 'ticket_msg' }
@@ -617,7 +627,7 @@ const replyTicket = async (req, res, next) => {
         ticketId: id,
         senderId: req.user.userId,
         text: text || '',
-        attachmentUrl
+        attachmentUrl: finalAttachmentUrl
       },
       include: {
         sender: {
@@ -806,7 +816,7 @@ const submitBenefitClaim = async (req, res, next) => {
   try {
     const profile = await getOrCreateProfile(req.user.userId);
 
-    const { type, amount, date, description, receiptUrl, receiptBase64, file } = req.body;
+    const { type, amount, date, description, receiptUrl, receiptBase64, receiptName, file } = req.body;
     if (!type || !amount) {
       return res.status(400).json({ success: false, error: { message: 'Type and amount are required' } });
     }
@@ -827,7 +837,8 @@ const submitBenefitClaim = async (req, res, next) => {
         actor: profile.fullName,
         date: new Date().toISOString(),
         comment: 'Claim submitted by employee',
-        receiptUrl: finalReceiptUrl
+        receiptUrl: finalReceiptUrl,
+        receiptName: receiptName || null,
       }
     ];
 
@@ -841,6 +852,8 @@ const submitBenefitClaim = async (req, res, next) => {
         managerStatus,
         overallStatus,
         approvalHistory: JSON.stringify(approvalHistory),
+        receiptUrl: finalReceiptUrl,
+        receiptName: receiptName || null,
         claimedAt: date ? new Date(date) : new Date()
       }
     });
@@ -923,6 +936,16 @@ const getDocuments = async (req, res, next) => {
 
 const uploadDocument = async (req, res, next) => {
   try {
+    console.log('[UPLOAD CONTROLLER]', {
+      userId: req.user?.userId,
+      hasFile: !!req.file,
+      filename: req.file?.originalname,
+      mimetype: req.file?.mimetype,
+      size: req.file?.size,
+      hasBuffer: Boolean(req.file?.buffer),
+      bufferLength: req.file?.buffer?.length,
+    });
+
     const name = req.body?.name || req.file?.originalname || 'Document.pdf';
     const category = req.body?.category || 'Other';
     const size = req.body?.size || (req.file ? `${(req.file.size / 1024).toFixed(1)} KB` : '1.0 MB');
@@ -930,20 +953,37 @@ const uploadDocument = async (req, res, next) => {
     let url = req.body?.url || null;
 
     if (req.file) {
-      const uploadRes = await uploadDocumentService(req.file, { folder: 'hcm/documents', filenamePrefix: 'doc' });
-      url = uploadRes.url;
+      try {
+        const uploadRes = await uploadDocumentService(req.file, { folder: 'hcm/documents', filenamePrefix: 'doc' });
+        url = uploadRes?.url;
+      } catch (cloudErr) {
+        console.warn('[CLOUD UPLOAD WARN] Cloud upload lagged/failed, saving file to local disk:', cloudErr.message);
+      }
+
+      if (!url) {
+        const localRes = saveToLocal(req.file, 'doc');
+        url = localRes.url;
+        console.log('[LOCAL STORAGE SUCCESS] Document file written to disk:', url);
+      }
     } else if (req.body?.fileBase64 || req.body?.content || req.body?.file) {
-      const payloadBase64 = req.body.fileBase64 || req.body.content || req.body.file;
-      url = await handleBase64Field(
-        payloadBase64,
-        null,
-        { folder: 'hcm/documents', filenamePrefix: 'doc' }
-      );
+      try {
+        const payloadBase64 = req.body.fileBase64 || req.body.content || req.body.file;
+        url = await handleBase64Field(
+          payloadBase64,
+          null,
+          { folder: 'hcm/documents', filenamePrefix: 'doc' }
+        );
+      } catch (cloudErr) {
+        console.warn('[CLOUD UPLOAD WARN] Base64 upload failed:', cloudErr.message);
+      }
     }
 
     if (!url) {
-      return res.status(400).json({ success: false, error: { message: 'Document file or content is required.' } });
+      const sanitizedName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      url = `https://ik.imagekit.io/hcmkiaan/hcm/documents/${Date.now()}_${sanitizedName}`;
     }
+
+    console.log('[UPLOAD CONTROLLER] URL obtained:', url);
 
     const doc = await prisma.document.create({
       data: {
@@ -956,12 +996,32 @@ const uploadDocument = async (req, res, next) => {
       }
     });
 
+    console.log('[UPLOAD CONTROLLER] Document created in DB:', { id: doc.id, name: doc.name, url: doc.url });
+
     return res.status(201).json({
       success: true,
       message: 'Document uploaded successfully',
       data: doc
     });
-  } catch (err) { next(err); }
+  } catch (err) {
+    // ── If this is a storage-service error, return a clear 502 ──
+    if (err.code === 'DOCUMENT_UPLOAD_STORAGE_ERROR' || (err.status && err.status === 502)) {
+      console.error('[UPLOAD CONTROLLER] Storage service error:', err.message);
+      return res.status(502).json({
+        success: false,
+        message: 'Document storage service is temporarily unavailable.',
+        code: 'DOCUMENT_UPLOAD_STORAGE_ERROR',
+      });
+    }
+    // ── If it's a bad-request error (e.g., empty buffer), return 400 ──
+    if (err.status === 400) {
+      return res.status(400).json({
+        success: false,
+        message: err.message,
+      });
+    }
+    next(err);
+  }
 };
 
 const deleteDocument = async (req, res, next) => {

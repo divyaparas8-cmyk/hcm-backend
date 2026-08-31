@@ -3,7 +3,8 @@
 // ============================================================
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middlewares/authMiddleware');
+const { protect, tenantGuard, authorize } = require('../middlewares/authMiddleware');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 const { checkPermission } = require('../middlewares/permissionMiddleware');
 const upload = require('../middlewares/upload');
 const fileUpload = require('../middlewares/fileUpload');
@@ -32,7 +33,7 @@ const {
 } = require('../controllers/compensationController');
 
 // Base authentication & platform role check
-router.use(protect, authorize('HR', 'ADMIN', 'SUPERADMIN'));
+router.use(protect, tenantGuard, authorize('HR', 'ADMIN', 'SUPERADMIN'));
 
 // Job Posts
 router.get('/jobs', checkPermission('job_posts', 'view'), getJobs);
@@ -76,7 +77,7 @@ router.patch('/interviews/:id/feedback', checkPermission('interviews', 'edit'), 
 
 // Employees
 router.get('/employees', checkPermission('onboarding', 'view'), getAllEmployees);
-router.post('/employees', checkPermission('onboarding', 'create'), onboardEmployee);
+router.post('/employees', checkPermission('onboarding', 'create'), subscriptionGuard('ADD_EMPLOYEE'), onboardEmployee);
 router.patch('/employees/:id/deactivate', checkPermission('onboarding', 'edit'), deactivateEmployee);
 router.patch('/employees/:id/confirm-probation', checkPermission('onboarding', 'approve'), confirmEmployeeProbation);
 router.patch('/employees/:id/extend-probation', checkPermission('onboarding', 'edit'), extendEmployeeProbation);

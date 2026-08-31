@@ -33,11 +33,7 @@ const createShift = async (req, res) => {
       return res.status(400).json({ message: 'Break duration must be less than total working hours.' });
     }
 
-    let organizationId = req.user?.organizationId;
-    if (!organizationId) {
-      const defaultOrg = await prisma.organization.findFirst({ select: { id: true } });
-      organizationId = defaultOrg?.id;
-    }
+    const organizationId = req.user.organizationId;
 
     if (isDefault && organizationId) {
       await prisma.shift.updateMany({

@@ -1,7 +1,7 @@
 const prisma = require('../config/prisma');
 
 const getOrgId = async (user) => {
-  if (user.organizationId) return user.organizationId;
+  if (user && user.organizationId) return user.organizationId;
   const defaultOrg = await prisma.organization.findFirst({ select: { id: true } });
   if (!defaultOrg) throw new Error("No organization found in the system.");
   return defaultOrg.id;

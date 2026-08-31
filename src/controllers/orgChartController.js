@@ -16,11 +16,7 @@ const { buildOrgChart } = require('../services/orgChartService');
 const getOrgChart = async (req, res, next) => {
   try {
     // Resolve the user's organization
-    let organizationId = req.user?.organizationId;
-    if (!organizationId) {
-      const defaultOrg = await prisma.organization.findFirst({ select: { id: true } });
-      organizationId = defaultOrg?.id;
-    }
+    const organizationId = req.user.organizationId;
 
     if (!organizationId) {
       return res.status(400).json({

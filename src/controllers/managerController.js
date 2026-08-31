@@ -42,7 +42,7 @@ const getTeam = async (req, res, next) => {
 // ─────────────────────────────────────────
 const getTeamLeaves = async (req, res, next) => {
   try {
-    const orgId = req.user.organizationId || (await prisma.organization.findFirst({ select: { id: true } }))?.id;
+    const orgId = req.user.organizationId;
 
     let whereClause = {};
     let assignedLeaveIds = [];
@@ -437,7 +437,7 @@ const updatePerformanceGoal = async (req, res, next) => {
 // ─────────────────────────────────────────
 const getTeamAttendance = async (req, res, next) => {
   try {
-    const orgId = req.user.organizationId || (await prisma.organization.findFirst({ select: { id: true } }))?.id;
+    const orgId = req.user.organizationId;
 
     let whereClause = {};
 

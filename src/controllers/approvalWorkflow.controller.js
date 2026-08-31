@@ -10,7 +10,7 @@ const getWorkflows = async (req, res, next) => {
   try {
     let orgId = req.user.organizationId;
     if (!orgId) {
-      const firstOrg = await prisma.organization.findFirst();
+      
       if (firstOrg) orgId = firstOrg.id;
     }
     const workflows = await prisma.approvalWorkflow.findMany({
@@ -26,7 +26,7 @@ const getWorkflowByModule = async (req, res, next) => {
   try {
     let orgId = req.user.organizationId;
     if (!orgId) {
-      const firstOrg = await prisma.organization.findFirst();
+      
       if (firstOrg) orgId = firstOrg.id;
     }
     const { module } = req.params;
@@ -51,7 +51,7 @@ const createWorkflow = async (req, res, next) => {
   try {
     let orgId = req.user.organizationId;
     if (!orgId) {
-      const firstOrg = await prisma.organization.findFirst();
+      
       if (firstOrg) orgId = firstOrg.id;
     }
 
@@ -112,7 +112,7 @@ const updateWorkflow = async (req, res, next) => {
   try {
     let orgId = req.user.organizationId;
     if (!orgId) {
-      const firstOrg = await prisma.organization.findFirst();
+      
       if (firstOrg) orgId = firstOrg.id;
     }
     const { id } = req.params;

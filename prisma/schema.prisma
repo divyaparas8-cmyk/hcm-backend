@@ -123,21 +123,27 @@ enum ProbationStatus {
 // 1. Organization (Tenant) Model
 // ============================================================
 model Organization {
-  id           String   @id @default(uuid())
-  name         String
-  legalName    String?
-  websiteUrl   String?
-  industry     String?
-  companySize  String?
-  logoUrl      String?  @db.LongText
-  address      String?
-  taxId        String?
-  primaryEmail String?
-  supportPhone String?
-  timezone     String?
-  currency     String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id                 String    @id @default(uuid())
+  name               String
+  legalName          String?
+  websiteUrl         String?
+  industry           String?
+  companySize        String?
+  logoUrl            String?   @db.LongText
+  address            String?
+  taxId              String?
+  primaryEmail       String?
+  supportPhone       String?
+  phone              String?
+  email              String?
+  timezone           String?
+  currency           String?
+  status             String    @default("ACTIVE")
+  subscriptionStatus String    @default("TRIAL")
+  subscriptionStart  DateTime?
+  subscriptionEnd    DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
 
   users             User[]
   departments       Department[]
@@ -154,9 +160,17 @@ model Organization {
   workCalendars     WorkCalendar[]
   leavePolicies     LeavePolicy[]
   attendancePolicy  AttendancePolicy?
+  jobPosts          JobPost[]
+  documents         Document[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  employeeProfiles  EmployeeProfile[]
 
-  pricingPlanId String?
-  pricingPlan   PricingPlan? @relation(fields: [pricingPlanId], references: [id])
+  pricingPlanId        String?
+  pricingPlan          PricingPlan?           @relation(fields: [pricingPlanId], references: [id])
+  Policy               Policy[]
+  PolicyAcknowledgment PolicyAcknowledgment[]
+  CustomRole           CustomRole[]
 
   @@map("organization")
 }
@@ -216,6 +230,7 @@ model Department {
   organization   Organization      @relation(fields: [organizationId], references: [id])
   employees      EmployeeProfile[]
 
+  @@unique([organizationId, name])
   @@map("department")
 }
 
@@ -223,11 +238,13 @@ model Department {
 // 4. Employee Detailed Profile
 // ============================================================
 model EmployeeProfile {
-  id     String @id @default(uuid())
-  userId String @unique
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id             String        @id @default(uuid())
+  userId         String        @unique
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
 
-  employeeId     String    @unique
+  employeeId     String
   fullName       String
   phone          String?
   dob            DateTime?
@@ -293,6 +310,7 @@ model EmployeeProfile {
   salaryType       String          @default("Monthly")
   hourlyRate       Float?
 
+  @@unique([organizationId, employeeId])
   @@map("employeeprofile")
 }
 
@@ -337,20 +355,22 @@ model CandidateProfile {
 // 6. Job Posting
 // ============================================================
 model JobPost {
-  id           String   @id @default(uuid())
-  title        String
-  department   String?
-  description  String   @db.Text
-  requirements String   @db.Text
-  salaryRange  String?
-  location     String?
-  jobType      String?
-  experience   String?
-  openings     Int      @default(1)
-  status       String   @default("Published")
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id             String        @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  title          String
+  department     String?
+  description    String        @db.Text
+  requirements   String        @db.Text
+  salaryRange    String?
+  location       String?
+  jobType        String?
+  experience     String?
+  openings       Int           @default(1)
+  status         String        @default("Published")
+  isActive       Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
   applications JobApplication[]
 
@@ -430,6 +450,7 @@ model Shift {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([organizationId, name])
   @@map("shift")
 }
 
@@ -495,6 +516,7 @@ model LeavePolicy {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
+  @@unique([organizationId, name])
   @@map("leavepolicy")
 }
 
@@ -511,6 +533,8 @@ model LeaveRequest {
   status           LeaveStatus @default(PENDING)
   managerComment   String?
   emergencyContact String?
+  attachmentName   String?
+  attachmentUrl    String?     @db.Text
 
   createdAt DateTime @default(now())
 
@@ -559,6 +583,8 @@ model BenefitClaim {
   managerStatus     String    @default("Pending")
   managerComment    String?   @db.Text
   managerApprovedAt DateTime?
+  receiptName       String?
+  receiptUrl        String?   @db.Text
 
   // Final Approval Tracking
   finalApprovalStatus  String    @default("Pending")
@@ -670,7 +696,9 @@ model AuditLog {
   details   String  @db.Text
   ipAddress String?
 
-  createdAt DateTime @default(now())
+  createdAt      DateTime      @default(now())
+  Organization   Organization? @relation(fields: [organizationId], references: [id])
+  organizationId String?
 
   @@map("auditlog")
 }
@@ -687,6 +715,8 @@ enum PolicyStatus {
 
 model Policy {
   id                    String                 @id @default(uuid())
+  organizationId        String?
+  organization          Organization?          @relation(fields: [organizationId], references: [id])
   name                  String
   category              String
   department            String?                @default("All")
@@ -705,6 +735,7 @@ model Policy {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([organizationId, name])
   @@map("policy")
 }
 
@@ -712,12 +743,14 @@ model Policy {
 // 18b. Policy Acknowledgment Model
 // ============================================================
 model PolicyAcknowledgment {
-  id        String   @id @default(uuid())
-  policyId  String
-  policy    Policy   @relation(fields: [policyId], references: [id], onDelete: Cascade)
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  createdAt DateTime @default(now())
+  id             String        @id @default(uuid())
+  policyId       String
+  policy         Policy        @relation(fields: [policyId], references: [id], onDelete: Cascade)
+  userId         String
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt      DateTime      @default(now())
 
   @@unique([policyId, userId])
   @@map("policyacknowledgment")
@@ -727,11 +760,13 @@ model PolicyAcknowledgment {
 // 19. Custom Role Model
 // ============================================================
 model CustomRole {
-  id          String  @id @default(uuid())
-  name        String  @unique
-  description String?
-  isCustom    Boolean @default(true)
-  permissions String  @db.Text // JSON string
+  id             String        @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  name           String        @unique
+  description    String?
+  isCustom       Boolean       @default(true)
+  permissions    String        @db.Text // JSON string
 
   users             User[]     @relation("AssignedCustomRole")
   inheritsFrom      Role       @default(EMPLOYEE)
@@ -747,6 +782,7 @@ model CustomRole {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([organizationId, name])
   @@map("customrole")
 }
 
@@ -791,6 +827,7 @@ model BenefitPlan {
 
   employeeBenefits EmployeeBenefit[]
 
+  @@unique([organizationId, name])
   @@map("benefitplan")
 }
 
@@ -881,15 +918,17 @@ model Announcement {
 // 25. Document Model
 // ============================================================
 model Document {
-  id        String   @id @default(uuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  name      String
-  category  String
-  size      String
-  url       String   @db.Text
-  date      String
-  createdAt DateTime @default(now())
+  id             String        @id @default(uuid())
+  userId         String
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  category       String
+  size           String
+  url            String        @db.Text
+  date           String
+  createdAt      DateTime      @default(now())
 
   @@map("document")
 }
@@ -968,6 +1007,7 @@ model GlobalSettings {
 
   @@map("globalsettings")
 }
+
 // ============================================================
 // 29. Offer Model
 // ============================================================
@@ -1065,17 +1105,19 @@ enum NotificationType {
 }
 
 model Notification {
-  id        String           @id @default(uuid())
-  userId    String
-  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  title     String
-  message   String           @db.Text
-  type      NotificationType @default(INFO)
-  isRead    Boolean          @default(false)
-  link      String?          @db.Text
-  metadata  Json?
-  createdAt DateTime         @default(now())
-  updatedAt DateTime         @updatedAt
+  id             String           @id @default(uuid())
+  userId         String
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title          String
+  message        String           @db.Text
+  type           NotificationType @default(INFO)
+  isRead         Boolean          @default(false)
+  link           String?          @db.Text
+  metadata       Json?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  Organization   Organization?    @relation(fields: [organizationId], references: [id])
+  organizationId String?
 
   @@map("notification")
 }
@@ -1196,6 +1238,7 @@ model SalaryBand {
 
   compensations CompensationProfile[]
 
+  @@unique([organizationId, name])
   @@map("salaryband")
 }
 
@@ -1224,6 +1267,7 @@ model SalaryComponent {
   employeeMappings  EmployeeSalaryComponent[]
   structureMappings SalaryStructureComponent[]
 
+  @@unique([organizationId, code])
   @@map("salarycomponent")
 }
 
@@ -1288,6 +1332,7 @@ model TaxRule {
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
+  @@unique([organizationId, name])
   @@map("taxrule")
 }
 
@@ -1585,5 +1630,3 @@ model WorkCalendarAssignment {
 
   @@map("workcalendarassignment")
 }
-
-

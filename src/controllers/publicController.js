@@ -32,6 +32,19 @@ const contactFormSchema = z.object({
 const fs = require('fs');
 const path = require('path');
 
+
+const registerOrganizationSchema = z.object({
+  organizationName: z.string().min(2, { message: 'Organization name must be at least 2 characters.' }),
+  industry: z.string().optional(),
+  companySize: z.string().optional(),
+  country: z.string().optional(),
+  adminFullName: z.string().min(2, { message: 'Admin full name must be at least 2 characters.' }),
+  adminEmail: z.string().email({ message: 'Valid admin email is required.' }),
+  adminPhone: z.string().optional(),
+  plan: z.string().optional(),
+  billingCycle: z.string().optional()
+});
+
 const careerApplicationSchema = z.object({
   jobId: z.string().optional(),
   jobTitle: z.string().optional(),
@@ -442,10 +455,184 @@ const getPlatformStats = async (req, res, next) => {
   }
 };
 
+
+// ---------- TENANT SAAS FLOWS ----------
+
+// POST /api/public/register-organization
+const registerOrganization = async (req, res, next) => {
+  try {
+    const parsed = registerOrganizationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: parsed.error?.issues?.[0]?.message || parsed.error?.errors?.[0]?.message || 'Validation failed.' },
+      });
+    }
+
+    const { organizationName, industry, companySize, country, adminFullName, adminEmail, adminPhone } = parsed.data;
+
+    // Check if email already exists
+    const existing = await prisma.user.findUnique({ where: { email: adminEmail } });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: { code: 'EMAIL_TAKEN', message: 'This email is already registered.' },
+      });
+    }
+
+    // Provision Tenant and User in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Create Organization
+      const org = await tx.organization.create({
+        data: {
+          name: organizationName,
+          industry: industry || 'Technology',
+          companySize: companySize || '1-50',
+          phone: adminPhone || null,
+          email: adminEmail || null,
+          status: 'ACTIVE',
+          subscriptionStatus: 'TRIAL',
+          subscriptionStart: new Date(),
+          subscriptionEnd: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14 days trial
+        }
+      });
+
+      // 2. Create Admin User
+      const user = await tx.user.create({
+        data: {
+          email: adminEmail,
+          passwordHash: 'INVITED_PENDING_PASSWORD',
+          role: 'ADMIN',
+          organizationId: org.id,
+          status: 'Pending',
+          isActive: false
+        }
+      });
+
+      // 3. Create EmployeeProfile
+      const empCode = 'EMP-' + Math.floor(1000 + Math.random() * 9000);
+      await tx.employeeProfile.create({
+        data: {
+          userId: user.id,
+          fullName: adminFullName,
+          employeeId: empCode,
+          organizationId: org.id
+        }
+      });
+
+      return { org, user };
+    });
+
+    const jwtHelper = require('../utils/jwtHelper');
+    const token = jwtHelper.signToken({
+      userId: result.user.id,
+      email: result.user.email,
+      organizationId: result.org.id,
+      organizationName: result.org.name,
+      purpose: 'invitation'
+    });
+
+    return res.status(201).json({
+      success: true,
+      data: {
+        token,
+        organizationName: result.org.name,
+        adminEmail: result.user.email
+      },
+      message: 'Workspace registered successfully.'
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/public/validate-invitation
+const validateInvitation = async (req, res, next) => {
+  try {
+    const { token } = req.body;
+    if (!token) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Token is required' } });
+    }
+
+    const jwtHelper = require('../utils/jwtHelper');
+    const decoded = jwtHelper.verifyToken(token);
+
+    if (decoded.purpose !== 'invitation') {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Invalid token purpose' } });
+    }
+
+    // Verify user exists and status is Pending
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      include: { organization: true }
+    });
+
+    if (!user || user.status !== 'Pending') {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Invitation is no longer valid.' } });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        email: user.email,
+        organizationName: user.organization?.name || 'Workspace'
+      }
+    });
+
+  } catch (err) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Token has expired or is invalid.' } });
+  }
+};
+
+// POST /api/public/setup-password
+const setupPassword = async (req, res, next) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Token and password are required' } });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Password must be at least 8 characters long.' } });
+    }
+
+    const jwtHelper = require('../utils/jwtHelper');
+    const decoded = jwtHelper.verifyToken(token);
+
+    if (decoded.purpose !== 'invitation') {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Invalid token purpose' } });
+    }
+
+    const bcrypt = require('bcryptjs');
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    await prisma.user.update({
+      where: { id: decoded.userId },
+      data: {
+        passwordHash,
+        status: 'Active',
+        isActive: true
+      }
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password set successfully. Account activated.'
+    });
+
+  } catch (err) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Token has expired or is invalid.' } });
+  }
+};
+
 module.exports = {
   bookDemo,
   submitContact,
   submitCareerApplication,
   getAvailableJobs,
-  getPlatformStats
+  getPlatformStats,
+  registerOrganization,
+  validateInvitation,
+  setupPassword
 };

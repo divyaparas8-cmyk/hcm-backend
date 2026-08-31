@@ -21,7 +21,8 @@ const {
   getAllPlatformDepartments, createPlatformDepartment, updatePlatformDepartment, deletePlatformDepartment,
   getPayrollHistory, getPayrollSettings, updatePayrollSettings,
   createPayslip, updatePayslip, deletePayslip, bulkApprovePayslips, generatePayroll, resetUserPassword,
-  getSystemSettings, updateSystemSettings
+  getSystemSettings, updateSystemSettings,
+  getGlobalUsage, getPlatformFeatures, updatePlatformFeatures
 } = require('../controllers/superAdminController');
 
 // 🔒 STRICT: Sirf SUPERADMIN
@@ -32,6 +33,9 @@ router.get('/stats', getPlatformStats);     // GET  /api/superadmin/stats
 router.get('/system-health', getSystemHealth);      // GET  /api/superadmin/system-health
 router.get('/analytics', getAnalytics);         // GET  /api/superadmin/analytics
 router.get('/analytics/export', getAnalyticsExport); // GET /api/superadmin/analytics/export
+router.get('/usage', getGlobalUsage);           // GET /api/superadmin/usage
+router.get('/features', getPlatformFeatures);   // GET /api/superadmin/features
+router.put('/features', updatePlatformFeatures); // PUT /api/superadmin/features
 
 // Settings & Config
 router.get('/settings', getSystemSettings);
