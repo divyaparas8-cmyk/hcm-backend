@@ -2,8 +2,10 @@ const prisma = require('../config/prisma');
 
 const tenantGuard = async (req, res, next) => {
   try {
-    // SuperAdmin bypasses tenant guards
-    if (req.user && req.user.role === 'SUPERADMIN') {
+    // NOTE: Candidates are allowed to register and login without an associated organization.
+    // The tenant guard would normally reject requests lacking an organizationId.
+    // To support candidate workflows, we explicitly bypass the tenant check for SUPERADMIN and CANDIDATE roles.
+    if (req.user && (req.user.role === 'SUPERADMIN' || req.user.role === 'CANDIDATE')) {
       return next();
     }
 

@@ -131,7 +131,8 @@ const reviewLeave = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const leave = await prisma.leaveRequest.findUnique({ 
@@ -241,7 +242,8 @@ const assignTask = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const task = await prisma.task.create({
@@ -389,7 +391,8 @@ const addPerformanceGoal = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const goal = await prisma.performanceGoal.create({
@@ -417,7 +420,8 @@ const updatePerformanceGoal = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const goal = await prisma.performanceGoal.update({
@@ -484,7 +488,8 @@ const addManualAttendance = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const { employeeProfileId, date, checkIn, checkOut, status, mode } = parsed.data;
@@ -563,7 +568,8 @@ const addTeamMember = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const data = parsed.data;
@@ -708,7 +714,8 @@ const addTeamLeaveRequest = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const { employeeId, leaveType, startDate, endDate, reason } = parsed.data;
@@ -789,7 +796,8 @@ const createTeamReview = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const managerProfile = await prisma.employeeProfile.findUnique({ where: { userId: req.user.userId } });
@@ -820,8 +828,8 @@ const updateTeamReview = async (req, res, next) => {
       where: { id: req.params.id },
       data: {
         ...(period && { period }),
-        ...(rating && { rating: rating.toString() }),
-        ...(text && { text }),
+        ...(rating !== undefined && rating !== null && { rating: rating.toString() }),
+        ...(text !== undefined && { text }),
       },
     });
 
@@ -843,7 +851,8 @@ const requestSalaryIncrement = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const { employeeId, requestedSalary, effectiveDate, reason } = parsed.data;
@@ -1106,7 +1115,7 @@ const getResignations = async (req, res, next) => {
         exitType: 'RESIGNATION'
       },
       include: {
-        employee: { select: { fullName: true, employeeId: true, avatarUrl: true, department: true } }
+        employee: { select: { id: true, managerId: true, fullName: true, employeeId: true, avatarUrl: true, department: true } }
       },
       orderBy: { submissionDate: 'desc' }
     });

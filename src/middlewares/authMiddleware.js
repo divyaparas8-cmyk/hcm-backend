@@ -9,17 +9,22 @@ const prisma = require('../config/prisma');
 // 1. PROTECT - Check karo ki user logged in hai ya nahi
 const protect = async (req, res, next) => {
   try {
-    // Token header se lo: "Authorization: Bearer <token>"
+    // Token can come from header: "Authorization: Bearer <token>" OR query param "?token=<token>" (for file downloads)
+    let token = null;
     const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    } else if (req.query && req.query.token) {
+      token = req.query.token;
+    }
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (!token) {
       return res.status(401).json({
         success: false,
         error: { code: 'NO_TOKEN', message: 'Access denied. No token provided.' },
       });
     }
 
-    const token = authHeader.split(' ')[1];
     const decoded = verifyToken(token); // Token verify karo
 
     // Verify user still exists in database (handles reset database state)
@@ -58,8 +63,46 @@ const protect = async (req, res, next) => {
       }
     }
 
+    if (!user.isActive) {
+      return res.status(401).json({
+        success: false,
+        error: { code: 'ACCOUNT_DEACTIVATED', message: 'Your account is deactivated. Please contact HR.' },
+      });
+    }
+
     // Decoded info ko req mein attach karo taaki controller use kar sake
-    const employeeProfile = await prisma.employeeProfile.findUnique({ where: { userId: user.id } });
+    const employeeProfile = await prisma.employeeProfile.findUnique({ 
+      where: { userId: user.id },
+      include: { exitLifecycle: true }
+    });
+
+    if (employeeProfile?.exitLifecycle) {
+      const exit = employeeProfile.exitLifecycle;
+      const approvedStatuses = ['APPROVED', 'CLEARANCE_IN_PROGRESS', 'PENDING_CLEARANCE'];
+      if (approvedStatuses.includes(exit.status)) {
+        const effectiveLwd = exit.finalLastWorkingDay ? new Date(exit.finalLastWorkingDay) : (exit.lastWorkingDay ? new Date(exit.lastWorkingDay) : null);
+        if (effectiveLwd && !isNaN(effectiveLwd.getTime())) {
+          const endOfLwd = new Date(effectiveLwd);
+          endOfLwd.setHours(23, 59, 59, 999);
+          if (new Date() > endOfLwd) {
+            await prisma.user.update({ where: { id: user.id }, data: { isActive: false, status: 'Inactive' } });
+            await prisma.exitLifecycle.update({ where: { id: exit.id }, data: { status: 'EMPLOYEE_RELIEVED' } });
+            return res.status(401).json({
+              success: false,
+              error: { code: 'EMPLOYMENT_ENDED', message: 'Your tenure has concluded and your account is deactivated.' }
+            });
+          }
+        }
+      } else if (exit.status === 'EMPLOYEE_RELIEVED' || exit.status === 'COMPLETED') {
+        if (user.isActive) {
+          await prisma.user.update({ where: { id: user.id }, data: { isActive: false, status: 'Inactive' } });
+        }
+        return res.status(401).json({
+          success: false,
+          error: { code: 'ACCOUNT_RELIEVED', message: 'Your account has been deactivated.' }
+        });
+      }
+    }
     
     // Determine effective role: custom role's inheritsFrom if active, else database user role
     const effectiveRole = (user.customRole && user.customRole.status === 'ACTIVE') 

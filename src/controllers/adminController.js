@@ -623,6 +623,7 @@ const createUser = async (req, res, next) => {
       name: z.string().trim().min(2, 'Full name is required.'),
       email: z.string().trim().email('Valid email is required.'),
       phone: z.string().regex(/^\d{8,15}$/, 'Phone number must be between 8 and 15 digits.'),
+      password: z.string().min(6, 'Password must be at least 6 characters.').optional(),
       empId: z.string().trim().min(2, 'Employee ID is required.'),
       role: z.string().trim().min(1, 'Organization role is required.'),
       department: z.string().trim().min(1, 'Department is required.'),
@@ -1000,7 +1001,7 @@ const toggleUserActive = async (req, res, next) => {
 const updateUser = async (req, res, next) => {
   try {
     const { name, email, role, department, empType, status, phone, address, manager, shiftId, overtimePolicyId, 
-      salaryType, hourlyRate, departmentId, password, customRoleId } = req.body;
+      salaryType, hourlyRate, departmentId, password, customRoleId, img, avatar, avatarUrl } = req.body;
       
     const existingUser = await prisma.user.findUnique({
       where: { id: req.params.id },
@@ -1035,6 +1036,8 @@ const updateUser = async (req, res, next) => {
       }
     }
 
+    const photoUrl = img !== undefined ? (img || null) : (avatarUrl !== undefined ? (avatarUrl || null) : (avatar !== undefined ? (avatar || null) : undefined));
+
     const empData = {
       ...(name !== undefined && { fullName: name }),
       ...(empType !== undefined && { employmentType: empType }),
@@ -1045,7 +1048,8 @@ const updateUser = async (req, res, next) => {
       ...(overtimePolicyId !== undefined && { overtimePolicyId: overtimePolicyId || null }),
       ...(salaryType !== undefined && { salaryType }),
       ...(hourlyRate !== undefined && { hourlyRate: hourlyRate ? parseFloat(hourlyRate) : null }),
-      ...(finalDeptId !== undefined && { departmentId: finalDeptId || null })
+      ...(finalDeptId !== undefined && { departmentId: finalDeptId || null }),
+      ...(photoUrl !== undefined && { avatarUrl: photoUrl })
     };
 
     const user = await prisma.user.update({
@@ -1595,6 +1599,27 @@ const getPolicies = async (req, res, next) => {
     const organizationId = req.user?.organizationId || req.tenant?.id;
     const policies = await prisma.policy.findMany({
       where: organizationId ? { organizationId } : {},
+      include: {
+        policyAcknowledgments: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                role: true,
+                employeeProfile: {
+                  select: {
+                    fullName: true,
+                    employeeId: true,
+                    avatarUrl: true,
+                    department: { select: { name: true } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       orderBy: { createdAt: 'desc' },
     });
     return res.status(200).json({ success: true, data: policies });
@@ -1755,12 +1780,14 @@ const sendPolicyReminder = async (req, res, next) => {
     });
 
     const ackUserIds = acknowledgedUsers.map(a => a.userId);
+    const organizationId = req.user?.organizationId || req.tenant?.id;
 
     // Find active employees who have NOT acknowledged it
     const pendingUsers = await prisma.user.findMany({
       where: {
-        role: 'EMPLOYEE',
-        status: 'ACTIVE',
+        ...(organizationId && { organizationId }),
+        isActive: true,
+        role: { not: 'SUPERADMIN' },
         id: { notIn: ackUserIds }
       }
     });
@@ -1953,7 +1980,7 @@ const deleteRole = async (req, res, next) => {
 const getHolidays = async (req, res, next) => {
   try {
     const organizationId = req.user?.organizationId || req.tenant?.id;
-    const holidays = await prisma.holiday.findMany({
+    let holidays = await prisma.holiday.findMany({
       where: organizationId ? {
         OR: [
           { calendar: { companyId: organizationId } },
@@ -1962,6 +1989,40 @@ const getHolidays = async (req, res, next) => {
       } : {},
       orderBy: { date: 'asc' }
     });
+
+    // If no holidays exist yet, auto-seed standard company holidays
+    if (holidays.length === 0) {
+      const currentYear = new Date().getFullYear();
+      const defaultHolidays = [
+        { name: "New Year's Day", date: `${currentYear}-01-01`, type: "PUBLIC", region: "Global", status: "Passed", repeat: true, description: "Worldwide New Year Celebration" },
+        { name: "Martin Luther King Jr. Day", date: `${currentYear}-01-19`, type: "PUBLIC", region: "USA", status: "Passed", repeat: true, description: "Federal Holiday" },
+        { name: "Republic Day", date: `${currentYear}-01-26`, type: "PUBLIC", region: "India", status: "Passed", repeat: true, description: "National Holiday" },
+        { name: "Good Friday", date: `${currentYear}-04-03`, type: "PUBLIC", region: "Global", status: "Upcoming", repeat: true, description: "Spring Holiday" },
+        { name: "Easter Monday", date: `${currentYear}-04-06`, type: "PUBLIC", region: "Europe", status: "Upcoming", repeat: true, description: "Easter Celebration" },
+        { name: "Memorial Day", date: `${currentYear}-05-25`, type: "PUBLIC", region: "USA", status: "Upcoming", repeat: true, description: "Federal Observance" },
+        { name: "Independence Day", date: `${currentYear}-07-04`, type: "PUBLIC", region: "USA", status: "Upcoming", repeat: true, description: "US Independence Day" },
+        { name: "Independence Day (India)", date: `${currentYear}-08-15`, type: "PUBLIC", region: "India", status: "Upcoming", repeat: true, description: "National Independence Day" },
+        { name: "Labor Day", date: `${currentYear}-09-07`, type: "PUBLIC", region: "USA", status: "Upcoming", repeat: true, description: "Workforce Day" },
+        { name: "Diwali / Deepavali", date: `${currentYear}-11-08`, type: "PUBLIC", region: "India", status: "Upcoming", repeat: true, description: "Festival of Lights" },
+        { name: "Thanksgiving Day", date: `${currentYear}-11-26`, type: "PUBLIC", region: "USA", status: "Upcoming", repeat: true, description: "National Thanksgiving" },
+        { name: "Christmas Day", date: `${currentYear}-12-25`, type: "PUBLIC", region: "Global", status: "Upcoming", repeat: true, description: "Christmas Holiday" },
+      ];
+
+      await prisma.holiday.createMany({
+        data: defaultHolidays
+      });
+
+      holidays = await prisma.holiday.findMany({
+        where: organizationId ? {
+          OR: [
+            { calendar: { companyId: organizationId } },
+            { calendarId: null }
+          ]
+        } : {},
+        orderBy: { date: 'asc' }
+      });
+    }
+
     return res.status(200).json({ success: true, data: holidays });
   } catch (err) { next(err); }
 };
@@ -2034,13 +2095,90 @@ const deleteHoliday = async (req, res, next) => {
 const getBenefitPlans = async (req, res, next) => {
   try {
     const organizationId = req.user?.organizationId || req.tenant?.id;
-    const plans = await prisma.benefitPlan.findMany({
-      where: organizationId ? { organizationId } : {},
+    let plans = await prisma.benefitPlan.findMany({
+      where: organizationId ? {
+        OR: [
+          { organizationId },
+          { organizationId: null }
+        ]
+      } : {},
       orderBy: { name: 'asc' },
       include: {
         employeeBenefits: true
       }
     });
+
+    // Auto-seed default corporate benefit plans if none exist
+    if (plans.length === 0) {
+      const defaultPlans = [
+        {
+          name: 'Comprehensive Health & Dental',
+          category: 'Insurance',
+          provider: 'Blue Cross Shield',
+          contribution: '$450/mo',
+          eligibility: 'All Employees',
+          status: 'Active',
+          empContribution: '$50/mo',
+          autoEnroll: true,
+          description: 'Full medical, dental, and vision coverage with low copay.',
+          organizationId: organizationId || null
+        },
+        {
+          name: '401(k) Retirement Plan',
+          category: 'Retirement',
+          provider: 'Vanguard Group',
+          contribution: '5% Match',
+          eligibility: 'Full-time Only',
+          status: 'Active',
+          empContribution: 'Up to 10%',
+          autoEnroll: false,
+          description: 'Employer matching up to 5% with pre-tax and Roth options.',
+          organizationId: organizationId || null
+        },
+        {
+          name: 'Wellness & Gym Stipend',
+          category: 'Wellness',
+          provider: 'ActiveFit Global',
+          contribution: '$75/mo',
+          eligibility: 'All Employees',
+          status: 'Active',
+          empContribution: '$0/mo',
+          autoEnroll: false,
+          description: 'Monthly reimbursement for gym memberships and mental wellness apps.',
+          organizationId: organizationId || null
+        },
+        {
+          name: 'Remote Work Allowance',
+          category: 'Allowance',
+          provider: 'Company Direct',
+          contribution: '$150/mo',
+          eligibility: 'All Employees',
+          status: 'Active',
+          empContribution: '$0/mo',
+          autoEnroll: true,
+          description: 'Home office ergonomic equipment and high-speed internet stipend.',
+          organizationId: organizationId || null
+        }
+      ];
+
+      for (const p of defaultPlans) {
+        await prisma.benefitPlan.create({ data: p });
+      }
+
+      plans = await prisma.benefitPlan.findMany({
+        where: organizationId ? {
+          OR: [
+            { organizationId },
+            { organizationId: null }
+          ]
+        } : {},
+        orderBy: { name: 'asc' },
+        include: {
+          employeeBenefits: true
+        }
+      });
+    }
+
     return res.status(200).json({ success: true, data: plans });
   } catch (err) { next(err); }
 };
@@ -2048,21 +2186,49 @@ const getBenefitPlans = async (req, res, next) => {
 const createBenefitPlan = async (req, res, next) => {
   try {
     const organizationId = req.user?.organizationId || req.tenant?.id;
+    const {
+      name,
+      category,
+      provider,
+      contribution,
+      eligibility,
+      status,
+      empContribution,
+      description,
+      autoEnroll
+    } = req.body;
+
     const plan = await prisma.benefitPlan.create({
       data: {
-        ...req.body,
-        organizationId
+        name: name || 'Benefit Plan',
+        category: category || 'Insurance',
+        provider: provider || 'Corporate Provider',
+        contribution: String(contribution || '0'),
+        eligibility: eligibility || 'All Employees',
+        status: status || 'Active',
+        empContribution: String(empContribution || '0.00'),
+        description: description || null,
+        autoEnroll: Boolean(autoEnroll),
+        organizationId: organizationId || null
+      },
+      include: {
+        employeeBenefits: true
       }
     });
 
     try {
       const { createNotification } = require('../utils/notificationHelper');
-      const users = await prisma.user.findMany({ where: { role: 'EMPLOYEE' } });
+      const users = await prisma.user.findMany({ 
+        where: { 
+          role: 'EMPLOYEE',
+          ...(organizationId && { organizationId })
+        } 
+      });
       for (const u of users) {
         await createNotification({
           userId: u.id,
           title: 'Benefits Enrollment',
-          message: `${plan.name} enrollment is now open. Enrollment ends soon.`,
+          message: `${plan.name} enrollment is now open.`,
           type: 'INFO',
           link: '/employee/benefits'
         });
@@ -2078,9 +2244,35 @@ const createBenefitPlan = async (req, res, next) => {
 const updateBenefitPlan = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const {
+      name,
+      category,
+      provider,
+      contribution,
+      eligibility,
+      status,
+      empContribution,
+      description,
+      autoEnroll
+    } = req.body;
+
+    const data = {};
+    if (name !== undefined) data.name = name;
+    if (category !== undefined) data.category = category;
+    if (provider !== undefined) data.provider = provider;
+    if (contribution !== undefined) data.contribution = String(contribution);
+    if (eligibility !== undefined) data.eligibility = eligibility;
+    if (status !== undefined) data.status = status;
+    if (empContribution !== undefined) data.empContribution = String(empContribution);
+    if (description !== undefined) data.description = description;
+    if (autoEnroll !== undefined) data.autoEnroll = Boolean(autoEnroll);
+
     const plan = await prisma.benefitPlan.update({
       where: { id },
-      data: req.body
+      data,
+      include: {
+        employeeBenefits: true
+      }
     });
     return res.status(200).json({ success: true, data: plan });
   } catch (err) { next(err); }
@@ -2089,8 +2281,12 @@ const updateBenefitPlan = async (req, res, next) => {
 const deleteBenefitPlan = async (req, res, next) => {
   try {
     const { id } = req.params;
+    // Delete any dependent employee benefit records first
+    await prisma.employeeBenefit.deleteMany({
+      where: { benefitPlanId: id }
+    });
     await prisma.benefitPlan.delete({ where: { id } });
-    return res.status(200).json({ success: true, message: 'Benefit plan deleted.' });
+    return res.status(200).json({ success: true, message: 'Benefit plan deleted successfully.' });
   } catch (err) { next(err); }
 };
 

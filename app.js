@@ -38,7 +38,7 @@ const PORT = process.env.PORT || 5001;
 // CORS: Frontend (localhost:5173, 5174, 5175) ko backend se baat karne do
 const envClientUrls = process.env.CLIENT_URL 
   ? process.env.CLIENT_URL.split(',').map(url => url.trim())
-  : ['http://localhost:5173'];
+  : ['http://localhost:5173','http://localhost:5174','http://localhost:5175'];
 
 const allowedOrigins = [
   ...envClientUrls,
@@ -81,6 +81,10 @@ if (!fs.existsSync(uploadsDir)) {
 app.use('/uploads', express.static(uploadsDir));
 
 // ---- HEALTH CHECK ----
+app.get('/health', (req, res) => {  // Health check endpoint
+  res.json({ status: 'ok' });
+});
+
 app.get('/', (req, res) => {
   res.json({ success: true, message: 'HCM Backend is running!' });
 });

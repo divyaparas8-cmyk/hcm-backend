@@ -2,7 +2,7 @@ const prisma = require('../config/prisma');
 
 exports.getAllCalendars = async (req, res, next) => {
   try {
-    const calendars = await prisma.workCalendar.findMany({
+    let calendars = await prisma.workCalendar.findMany({
       include: {
         versions: {
           include: {
@@ -15,6 +15,44 @@ exports.getAllCalendars = async (req, res, next) => {
         holidays: true
       }
     });
+
+    if (calendars.length === 0) {
+      await prisma.workCalendar.create({
+        data: {
+          name: 'Standard Corporate Calendar',
+          description: 'Standard Monday-Friday 40hr work week schedule',
+          timezone: 'UTC',
+          isDefaultCompanyCalendar: true,
+          status: 'ACTIVE',
+          versions: {
+            create: {
+              versionNumber: 1,
+              weekends: {
+                create: [
+                  { dayOfWeek: 'SATURDAY', type: 'FULL_DAY' },
+                  { dayOfWeek: 'SUNDAY', type: 'FULL_DAY' }
+                ]
+              }
+            }
+          }
+        }
+      });
+
+      calendars = await prisma.workCalendar.findMany({
+        include: {
+          versions: {
+            include: {
+              weekends: true
+            },
+            orderBy: { versionNumber: 'desc' },
+            take: 1
+          },
+          assignments: true,
+          holidays: true
+        }
+      });
+    }
+
     res.json({ success: true, data: calendars });
   } catch (err) {
     next(err);

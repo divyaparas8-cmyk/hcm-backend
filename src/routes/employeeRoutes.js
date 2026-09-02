@@ -12,7 +12,7 @@ const {
   getProfile, updateProfile,
   clockIn, clockOut, getAttendance,
   getLeaves, applyLeave, cancelLeave,
-  getPayslips, getPerformance, createGoal, updateGoalProgress, deleteGoal, upsertSkill, deleteSkill,
+  getPayslips, getPerformance, createGoal, updateGoal, updateGoalProgress, deleteGoal, upsertSkill, deleteSkill,
   getTickets, createTicket, replyTicket, deleteTicketMessage,
   getBenefits, submitBenefitClaim, enrollBenefitPlan, unenrollBenefitPlan, getTasks,
   getDocuments, uploadDocument, deleteDocument,
@@ -59,6 +59,8 @@ router.post('/compensation/increment', requestIncrement);
 router.get('/payroll/snapshots', getPayrollSnapshots);
 router.get('/performance', getPerformance);
 router.post('/performance/goals', createGoal);
+router.patch('/performance/goals/:id', updateGoal);
+router.put('/performance/goals/:id', updateGoal);
 router.post('/performance/goals/:id/progress', updateGoalProgress);
 router.delete('/performance/goals/:id', deleteGoal);
 router.post('/performance/skills', upsertSkill);
@@ -71,7 +73,11 @@ router.get('/tasks', getTasks);
 
 // Performance
 router.get('/performance', checkPermission('performance', 'view'), getPerformance);
+router.post('/performance/goals', checkPermission('performance', 'create'), createGoal);
+router.patch('/performance/goals/:id', checkPermission('performance', 'edit'), updateGoal);
+router.put('/performance/goals/:id', checkPermission('performance', 'edit'), updateGoal);
 router.post('/performance/goals/:id/progress', checkPermission('performance', 'create'), updateGoalProgress);
+router.delete('/performance/goals/:id', checkPermission('performance', 'delete'), deleteGoal);
 router.post('/performance/skills', checkPermission('performance', 'create'), upsertSkill);
 router.delete('/performance/skills/:id', checkPermission('performance', 'delete'), deleteSkill);
 

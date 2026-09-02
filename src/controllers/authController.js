@@ -56,8 +56,63 @@ const login = async (req, res, next) => {
     if (!user.isActive) {
       return res.status(403).json({
         success: false,
-        error: { code: 'ACCOUNT_SUSPENDED', message: 'Your account is suspended. Please contact support.' },
+        error: { code: 'ACCOUNT_SUSPENDED', message: 'Your account has been deactivated. Please contact support or HR.' },
       });
+    }
+
+    // Dynamic Resignation & Last Working Day (LWD) Check
+    const employeeProfile = await prisma.employeeProfile.findUnique({
+      where: { userId: user.id },
+      include: { exitLifecycle: true }
+    });
+
+    if (employeeProfile?.exitLifecycle) {
+      const exit = employeeProfile.exitLifecycle;
+      const today = new Date();
+
+      // Case 1: Status is EMPLOYEE_RELIEVED or COMPLETED
+      if (exit.status === 'EMPLOYEE_RELIEVED' || exit.status === 'COMPLETED') {
+        if (user.isActive) {
+          await prisma.user.update({ where: { id: user.id }, data: { isActive: false, status: 'Inactive' } });
+        }
+        return res.status(403).json({
+          success: false,
+          error: {
+            code: 'ACCOUNT_RELIEVED',
+            message: 'Your account has been deactivated as your employment tenure has concluded. Please contact HR for assistance.'
+          }
+        });
+      }
+
+      // Case 2: Resignation is APPROVED / CLEARANCE_IN_PROGRESS and LWD has passed
+      const approvedStatuses = ['APPROVED', 'CLEARANCE_IN_PROGRESS', 'PENDING_CLEARANCE'];
+      if (approvedStatuses.includes(exit.status)) {
+        const effectiveLwd = exit.finalLastWorkingDay ? new Date(exit.finalLastWorkingDay) : (exit.lastWorkingDay ? new Date(exit.lastWorkingDay) : null);
+        if (effectiveLwd && !isNaN(effectiveLwd.getTime())) {
+          const endOfLwd = new Date(effectiveLwd);
+          endOfLwd.setHours(23, 59, 59, 999);
+
+          if (today > endOfLwd) {
+            await prisma.user.update({
+              where: { id: user.id },
+              data: { isActive: false, status: 'Inactive' }
+            });
+            await prisma.exitLifecycle.update({
+              where: { id: exit.id },
+              data: { status: 'EMPLOYEE_RELIEVED' }
+            });
+
+            const formattedDate = effectiveLwd.toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' });
+            return res.status(403).json({
+              success: false,
+              error: {
+                code: 'EMPLOYMENT_ENDED',
+                message: `Your account has been deactivated as your last working day (${formattedDate}) has passed. Please contact HR.`
+              }
+            });
+          }
+        }
+      }
     }
 
     // Tenant Status Check: Non-superadmins cannot log in if organization is deactivated/suspended
@@ -117,6 +172,19 @@ const login = async (req, res, next) => {
       ? user.customRole.inheritsFrom 
       : user.role;
 
+    // Fetch employeeProfile / candidateProfile to populate full details
+    const empProfile = await prisma.employeeProfile.findUnique({
+      where: { userId: user.id },
+      include: { department: true, manager: true }
+    });
+    const candProfile = !empProfile ? await prisma.candidateProfile.findUnique({
+      where: { userId: user.id }
+    }) : null;
+
+    const fullName = empProfile?.fullName || candProfile?.fullName || user.email.split('@')[0];
+    const avatar = empProfile?.avatarUrl || candProfile?.avatarUrl || '';
+    const phone = empProfile?.phone || candProfile?.phone || '';
+
     // 5. Response bhejo (password kabhi mat bhejo!)
     return res.status(200).json({
       success: true,
@@ -126,9 +194,16 @@ const login = async (req, res, next) => {
           id: user.id,
           email: user.email,
           role: effectiveRole,
+          name: fullName,
+          fullName: fullName,
+          avatar: avatar,
+          avatarUrl: avatar,
+          phone: phone,
           organizationId: user.organizationId,
           customRoleId: user.customRoleId,
           landingPage: (user.customRole?.status === 'ACTIVE' && user.customRole?.landingPage) ? user.customRole.landingPage : null,
+          employeeProfile: empProfile,
+          candidateProfile: candProfile
         },
       },
     });
@@ -232,8 +307,12 @@ const getMe = async (req, res, next) => {
         customRole: {
           select: { id: true, name: true, landingPage: true, permissionVersion: true, status: true, inheritsFrom: true }
         },
+        organization: {
+          select: { id: true, name: true, logoUrl: true }
+        },
         employeeProfile: {
           select: {
+            id: true,
             fullName: true,
             phone: true,
             dob: true,
@@ -246,7 +325,18 @@ const getMe = async (req, res, next) => {
             dateFormat: true,
             emailNotif: true,
             pushNotif: true,
-            weeklySummary: true
+            weeklySummary: true,
+            employeeId: true,
+            department: { select: { name: true } },
+            joiningDate: true,
+            manager: { select: { fullName: true } }
+          }
+        },
+        candidateProfile: {
+          select: {
+            fullName: true,
+            phone: true,
+            avatarUrl: true
           }
         }
       },
@@ -264,7 +354,25 @@ const getMe = async (req, res, next) => {
       user.role = user.customRole.inheritsFrom;
     }
 
-    return res.status(200).json({ success: true, data: user });
+    const fullName = user.employeeProfile?.fullName || user.candidateProfile?.fullName || user.email.split('@')[0];
+    const avatar = user.employeeProfile?.avatarUrl || user.candidateProfile?.avatarUrl || '';
+    const phone = user.employeeProfile?.phone || user.candidateProfile?.phone || '';
+
+    const formattedUser = {
+      ...user,
+      name: fullName,
+      fullName: fullName,
+      avatar: avatar,
+      avatarUrl: avatar,
+      phone: phone,
+      department: user.employeeProfile?.department?.name || '',
+      employeeId: user.employeeProfile?.employeeId || '',
+      designation: user.customRole?.name || user.role || 'Staff',
+      joiningDate: user.employeeProfile?.joiningDate || '',
+      manager: user.employeeProfile?.manager?.fullName || ''
+    };
+
+    return res.status(200).json({ success: true, data: formattedUser });
 
   } catch (err) {
     next(err);

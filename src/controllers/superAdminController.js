@@ -1017,7 +1017,7 @@ const createUser = async (req, res, next) => {
 
 const updateUser = async (req, res, next) => {
   try {
-    const { name, email, role, department, empType, status, phone, address, manager, shiftId, overtimePolicyId, salaryType, hourlyRate, departmentId, password, salary, baseSalary, monthlyCTC } = req.body;
+    const { name, email, role, department, empType, status, phone, address, manager, shiftId, overtimePolicyId, salaryType, hourlyRate, departmentId, password, salary, baseSalary, monthlyCTC, img, avatar, avatarUrl } = req.body;
     let orgId = undefined;
     if (department) {
       const org = await prisma.organization.findFirst({ where: { name: department } });
@@ -1042,6 +1042,8 @@ const updateUser = async (req, res, next) => {
     const rawSalary = salary ?? baseSalary ?? monthlyCTC;
     const salaryVal = rawSalary !== undefined && rawSalary !== null && rawSalary !== '' ? Number(rawSalary) : undefined;
 
+    const photoUrl = img !== undefined ? (img || null) : (avatarUrl !== undefined ? (avatarUrl || null) : (avatar !== undefined ? (avatar || null) : undefined));
+
     // We can update the EmployeeProfile with all these fields
     const empData = {
       ...(name && { fullName: name }),
@@ -1053,7 +1055,8 @@ const updateUser = async (req, res, next) => {
       ...(overtimePolicyId !== undefined && { overtimePolicyId: overtimePolicyId || null }),
       ...(salaryType && { salaryType }),
       ...(hourlyRate !== undefined && { hourlyRate: hourlyRate ? parseFloat(hourlyRate) : null }),
-      ...(departmentId !== undefined && { departmentId: departmentId || null })
+      ...(departmentId !== undefined && { departmentId: departmentId || null }),
+      ...(photoUrl !== undefined && { avatarUrl: photoUrl })
     };
 
     const user = await prisma.user.update({
@@ -1835,33 +1838,75 @@ const generatePayroll = async (req, res, next) => {
 const updateOrgSubscription = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { plan, pricingPlanId, maxEmployees, maxStorageGB, status } = req.body;
+    const { plan, pricingPlanId, status, subscriptionStatus, billingCycle } = req.body;
 
-    const org = await prisma.organization.findUnique({ where: { id } });
+    const org = await prisma.organization.findUnique({
+      where: { id },
+      include: { pricingPlan: true }
+    });
     if (!org) {
       return res.status(404).json({ success: false, error: { message: "Organization not found." } });
     }
 
     const data = {};
-    if (plan) data.plan = plan;
-    if (pricingPlanId) data.pricingPlanId = pricingPlanId;
-    if (maxEmployees !== undefined) data.maxEmployees = parseInt(maxEmployees, 10);
-    if (maxStorageGB !== undefined) data.maxStorageGB = parseInt(maxStorageGB, 10);
-    if (status) data.status = status;
 
-    if (data.maxEmployees) {
-      const activeEmployees = await prisma.employeeProfile.count({
-        where: { user: { organizationId: id, isActive: true } }
+    // Match and link PricingPlan if plan name or pricingPlanId is provided
+    let matchedPlan = null;
+    if (pricingPlanId || plan) {
+      matchedPlan = await prisma.pricingPlan.findFirst({
+        where: {
+          OR: [
+            ...(pricingPlanId ? [{ id: pricingPlanId }] : []),
+            ...(plan ? [{ id: plan }, { name: plan }] : [])
+          ]
+        }
       });
-      if (activeEmployees > data.maxEmployees) {
-        return res.status(400).json({
-          success: false,
-          error: {
-            code: 'LIMIT_EXCEEDED',
-            message: `Cannot lower employee limit to ${data.maxEmployees} because organization currently has ${activeEmployees} active employees.`
+
+      if (matchedPlan) {
+        data.pricingPlanId = matchedPlan.id;
+
+        // Check active employee seat limit
+        if (matchedPlan.maxEmployees) {
+          const activeEmployees = await prisma.employeeProfile.count({
+            where: { user: { organizationId: id, isActive: true } }
+          });
+          if (activeEmployees > matchedPlan.maxEmployees) {
+            return res.status(400).json({
+              success: false,
+              error: {
+                code: 'LIMIT_EXCEEDED',
+                message: `Cannot switch to ${matchedPlan.name} (limit: ${matchedPlan.maxEmployees} employees) because organization currently has ${activeEmployees} active employees.`
+              }
+            });
           }
-        });
+        }
       }
+    }
+
+    // Update status if passed
+    if (status) {
+      const upperStatus = status.toUpperCase();
+      if (['ACTIVE', 'INACTIVE', 'SUSPENDED'].includes(upperStatus)) {
+        data.status = upperStatus;
+      } else if (status.toLowerCase() === 'active') {
+        data.status = 'ACTIVE';
+      } else if (status.toLowerCase() === 'suspended') {
+        data.status = 'SUSPENDED';
+      } else if (status.toLowerCase() === 'trial') {
+        data.status = 'ACTIVE';
+        data.subscriptionStatus = 'TRIAL';
+      }
+    }
+
+    // Update subscriptionStatus if passed
+    if (subscriptionStatus) {
+      data.subscriptionStatus = subscriptionStatus.toUpperCase();
+    } else if (status && status.toLowerCase() === 'trial') {
+      data.subscriptionStatus = 'TRIAL';
+    } else if (status && status.toLowerCase() === 'expired') {
+      data.subscriptionStatus = 'EXPIRED';
+    } else if (status && status.toLowerCase() === 'active' && !data.subscriptionStatus) {
+      data.subscriptionStatus = 'ACTIVE';
     }
 
     const updatedOrg = await prisma.organization.update({
@@ -1870,21 +1915,24 @@ const updateOrgSubscription = async (req, res, next) => {
       include: { pricingPlan: true }
     });
 
-    try {
-      await prisma.auditLog.create({
-        data: {
-          userId: req.user.userId,
-          action: 'UPDATE_ORG_SUBSCRIPTION',
-          details: `Updated subscription for ${org.name}: Plan=${updatedOrg.plan}, MaxEmployees=${updatedOrg.maxEmployees}`,
-          ipAddress: req.ip || req.socket.remoteAddress
-        }
-      });
-    } catch (aErr) {}
+    const userId = req.user?.userId || req.user?.id;
+    if (userId) {
+      try {
+        await prisma.auditLog.create({
+          data: {
+            userId,
+            action: 'UPDATE_ORG_SUBSCRIPTION',
+            details: `Updated subscription for ${org.name}: Plan=${updatedOrg.pricingPlan?.name || 'Standard'}, Status=${updatedOrg.status}, SubStatus=${updatedOrg.subscriptionStatus}`,
+            ipAddress: req.ip || req.socket.remoteAddress
+          }
+        });
+      } catch (aErr) {}
+    }
 
     return res.status(200).json({
       success: true,
       data: updatedOrg,
-      message: `Subscription updated for ${org.name}`
+      message: `Subscription updated successfully for ${org.name}`
     });
   } catch (err) { next(err); }
 };
@@ -2034,15 +2082,38 @@ const getGlobalUsage = async (req, res, next) => {
 const STANDARD_MODULE_FEATURES = [
   { id: 'attendance_leave', name: 'Attendance & Leave Tracking', category: 'Core HR', description: 'Web clock-in/out, timesheets, and leave management' },
   { id: 'employee_directory', name: 'Employee Directory & Profiles', category: 'Core HR', description: 'Centralized employee records, docs, and org charts' },
+  { id: 'shifts_calendars', name: 'Shifts & Work Calendars', category: 'Core HR', description: 'Shift rotations, work calendar versions, and holiday schedules' },
   { id: 'payroll_operations', name: 'Payroll & Compensation', category: 'Payroll', description: 'Salary components, deductions, tax brackets & pay runs' },
+  { id: 'benefits_insurance', name: 'Benefits & Insurance Config', category: 'Benefits', description: 'Employee insurance schemes and wellness allowances' },
   { id: 'recruitment_pipeline', name: 'Recruitment & Job Pipeline', category: 'Recruitment', description: 'Job posts, Kanban candidate funnel, and offer letters' },
   { id: 'ai_resume_scoring', name: 'AI Resume Scoring & Matching', category: 'AI & Automation', description: 'Automated resume analysis, scoring, and matching' },
-  { id: 'benefits_insurance', name: 'Benefits & Insurance Config', category: 'Benefits', description: 'Employee insurance schemes and wellness allowances' },
   { id: 'performance_kpi', name: 'Performance & KPI Tracking', category: 'Performance', description: '1-on-1 reviews, objectives, and KPI targets' },
   { id: 'approval_workflows', name: 'Custom Approval Workflows', category: 'Automation', description: 'Multi-level approval chains for leaves & expenses' },
+  { id: 'documents_vault', name: 'Document Vault & Storage', category: 'Documents', description: 'Secure document storage, categories, and employee vault' },
+  { id: 'support_tickets', name: 'Help Desk & Support Tickets', category: 'Support', description: 'Internal support tickets, communication threads, and SLA tracking' },
+  { id: 'backup_center', name: 'Organization Backup Center', category: 'Data & Backup', description: 'Tenant data & documents export, Google Drive sync, and archives' },
+  { id: 'offboarding_exit', name: 'Offboarding & Exit Lifecycle', category: 'Core HR', description: 'Resignations, clearance checklists, and exit interviews' },
   { id: 'advanced_reports', name: 'Advanced Analytics & Exports', category: 'Analytics', description: 'Custom report builder and scheduled automated exports' },
   { id: 'audit_compliance', name: 'Audit Logs & Statutory Compliance', category: 'Security', description: 'Granular audit logs and compliance policy center' }
 ];
+
+const standardFeatureIdSet = new Set(STANDARD_MODULE_FEATURES.map(f => f.id));
+
+const getDefaultFeaturesForPlan = (planName, monthlyPrice = 0) => {
+  const lower = (planName || '').toLowerCase();
+  if (lower.includes('enterprise') || lower.includes('unlimited')) {
+    return STANDARD_MODULE_FEATURES.map(f => f.id);
+  } else if (lower.includes('pro') || lower.includes('growth') || lower.includes('demanded') || monthlyPrice >= 30) {
+    return [
+      'attendance_leave', 'employee_directory', 'shifts_calendars', 'payroll_operations',
+      'benefits_insurance', 'recruitment_pipeline', 'ai_resume_scoring', 'performance_kpi',
+      'approval_workflows', 'documents_vault', 'support_tickets', 'backup_center',
+      'offboarding_exit', 'audit_compliance'
+    ];
+  } else {
+    return ['attendance_leave', 'employee_directory', 'performance_kpi', 'support_tickets', 'documents_vault'];
+  }
+};
 
 const getPlatformFeatures = async (req, res, next) => {
   try {
@@ -2063,7 +2134,7 @@ const getPlatformFeatures = async (req, res, next) => {
     const plansFeaturesMap = {};
     const plansList = [];
 
-    dbPlans.forEach(plan => {
+    for (const plan of dbPlans) {
       plansList.push({
         id: plan.id,
         name: plan.name,
@@ -2073,20 +2144,32 @@ const getPlatformFeatures = async (req, res, next) => {
         isPopular: plan.isPopular
       });
 
-      const assigned = plan.features.map(f => f.feature);
+      // Filter for features that match standard feature IDs
+      const assigned = plan.features.map(f => f.feature).filter(f => standardFeatureIdSet.has(f));
+
       if (assigned.length > 0) {
         plansFeaturesMap[plan.name] = assigned;
+        plansFeaturesMap[plan.id] = assigned;
       } else {
-        const lower = plan.name.toLowerCase();
-        if (lower.includes('enterprise') || lower.includes('unlimited')) {
-          plansFeaturesMap[plan.name] = STANDARD_MODULE_FEATURES.map(f => f.id);
-        } else if (lower.includes('pro') || lower.includes('growth') || lower.includes('demanded')) {
-          plansFeaturesMap[plan.name] = ['attendance_leave', 'employee_directory', 'payroll_operations', 'recruitment_pipeline', 'benefits_insurance', 'performance_kpi', 'approval_workflows', 'audit_compliance'];
-        } else {
-          plansFeaturesMap[plan.name] = ['attendance_leave', 'employee_directory', 'performance_kpi'];
+        // Fallback to default tier feature set and auto-persist so it remains stored in DB
+        const defaultFeats = getDefaultFeaturesForPlan(plan.name, plan.monthlyPrice);
+        plansFeaturesMap[plan.name] = defaultFeats;
+        plansFeaturesMap[plan.id] = defaultFeats;
+
+        // Auto-seed in background for permanent persistence
+        try {
+          await prisma.pricingFeature.createMany({
+            data: defaultFeats.map((feat, idx) => ({
+              pricingPlanId: plan.id,
+              feature: feat,
+              displayOrder: idx
+            }))
+          });
+        } catch (seedErr) {
+          // Ignore unique / concurrency errors
         }
       }
-    });
+    }
 
     return res.status(200).json({
       success: true,
@@ -2114,14 +2197,14 @@ const updatePlatformFeatures = async (req, res, next) => {
     }
 
     // Persist to Prisma PricingFeature table for each plan
-    for (const [planName, featureIds] of Object.entries(plans)) {
+    for (const [planKey, featureIds] of Object.entries(plans)) {
       if (Array.isArray(featureIds)) {
         const plan = await prisma.pricingPlan.findFirst({
-          where: { OR: [{ name: planName }, { id: planName }] }
+          where: { OR: [{ id: planKey }, { name: planKey }] }
         });
 
         if (plan) {
-          // Delete old feature mappings for this plan
+          // Delete old standard feature mappings for this plan
           await prisma.pricingFeature.deleteMany({
             where: { pricingPlanId: plan.id }
           });
@@ -2140,20 +2223,86 @@ const updatePlatformFeatures = async (req, res, next) => {
       }
     }
 
-    if (req.user) {
+    const userId = req.user?.userId || req.user?.id;
+    if (userId) {
       await prisma.auditLog.create({
         data: {
-          userId: req.user.userId,
+          userId,
           action: 'UPDATE_FEATURE_ENTITLEMENTS',
           details: `Updated SaaS feature matrix for plans: ${Object.keys(plans).join(', ')}`,
           ipAddress: req.ip || req.socket.remoteAddress
         }
-      });
+      }).catch(() => {});
     }
 
     return res.status(200).json({
       success: true,
       message: 'Plan feature entitlements saved permanently to the database.'
+    });
+  } catch (err) { next(err); }
+};
+
+const togglePlatformFeature = async (req, res, next) => {
+  try {
+    const { planId, planName, featureId, isEnabled } = req.body;
+    if (!featureId || (!planId && !planName)) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_DATA', message: 'Plan identifier and featureId are required.' }
+      });
+    }
+
+    const plan = await prisma.pricingPlan.findFirst({
+      where: { OR: [
+        ...(planId ? [{ id: planId }] : []),
+        ...(planName ? [{ name: planName }] : [])
+      ] },
+      include: { features: true }
+    });
+
+    if (!plan) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'PLAN_NOT_FOUND', message: 'Pricing plan not found.' }
+      });
+    }
+
+    const existingFeature = plan.features.find(f => f.feature === featureId);
+
+    if (isEnabled && !existingFeature) {
+      await prisma.pricingFeature.create({
+        data: {
+          pricingPlanId: plan.id,
+          feature: featureId,
+          displayOrder: plan.features.length
+        }
+      });
+    } else if (!isEnabled && existingFeature) {
+      await prisma.pricingFeature.delete({
+        where: { id: existingFeature.id }
+      });
+    }
+
+    // Return updated feature list for this plan
+    const updatedPlan = await prisma.pricingPlan.findUnique({
+      where: { id: plan.id },
+      include: { features: true }
+    });
+
+    const activeFeatures = (updatedPlan?.features || [])
+      .map(f => f.feature)
+      .filter(f => standardFeatureIdSet.has(f));
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        planId: plan.id,
+        planName: plan.name,
+        featureId,
+        isEnabled: !!isEnabled,
+        features: activeFeatures
+      },
+      message: `Feature ${featureId} ${isEnabled ? 'enabled' : 'disabled'} for ${plan.name}`
     });
   } catch (err) { next(err); }
 };
@@ -2175,5 +2324,6 @@ module.exports = {
   getSystemSettings, updateSystemSettings,
   getGlobalUsage,
   getPlatformFeatures,
-  updatePlatformFeatures
+  updatePlatformFeatures,
+  togglePlatformFeature
 };

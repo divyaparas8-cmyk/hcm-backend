@@ -139,6 +139,18 @@ router.post('/benefits', checkPermission('benefits_config', 'create'), createBen
 router.put('/benefits/:id', checkPermission('benefits_config', 'edit'), updateBenefitPlan);
 router.delete('/benefits/:id', checkPermission('benefits_config', 'delete'), deleteBenefitPlan);
 
+// Shift Management
+router.get('/shifts', checkPermission('shift_management', 'view'), getShifts);
+router.post('/shifts', checkPermission('shift_management', 'create'), createShift);
+router.put('/shifts/:id', checkPermission('shift_management', 'edit'), updateShift);
+router.delete('/shifts/:id', checkPermission('shift_management', 'delete'), deleteShift);
+
+// Overtime Policies
+router.get('/overtime-policies', checkPermission('overtime_rules', 'view'), getOvertimePolicies);
+router.post('/overtime-policies', checkPermission('overtime_rules', 'create'), createOvertimePolicy);
+router.put('/overtime-policies/:id', checkPermission('overtime_rules', 'edit'), updateOvertimePolicy);
+router.delete('/overtime-policies/:id', checkPermission('overtime_rules', 'delete'), deleteOvertimePolicy);
+
 // AI Center
 router.get('/ai/modules', checkPermission('ai_center', 'view'), getAiModules);
 router.put('/ai/modules/:id', checkPermission('ai_center', 'edit'), updateAiModule);
@@ -169,29 +181,5 @@ router.patch('/leaves/:id', checkPermission('dashboard', 'approve'), reviewLeave
 // Resignations
 router.get('/resignations', checkPermission('resignations', 'view'), getAdminResignations);
 router.patch('/resignations/:id/override', checkPermission('resignations', 'approve'), overrideResignation);
-
-// Shifts
-router.get('/shifts', checkPermission('shift_management', 'view'), getShifts);
-router.post('/shifts', checkPermission('shift_management', 'create'), createShift);
-router.put('/shifts/:id', checkPermission('shift_management', 'edit'), updateShift);
-router.delete('/shifts/:id', checkPermission('shift_management', 'delete'), deleteShift);
-
-// Overtime Policies
-router.get('/overtime-policies', checkPermission('overtime_rules', 'view'), getOvertimePolicies);
-router.post('/overtime-policies', checkPermission('overtime_rules', 'create'), createOvertimePolicy);
-router.put('/overtime-policies/:id', checkPermission('overtime_rules', 'edit'), updateOvertimePolicy);
-router.delete('/overtime-policies/:id', checkPermission('overtime_rules', 'delete'), deleteOvertimePolicy);
-
-// Holidays
-router.get('/holidays', checkPermission('holidays', 'view'), getHolidays);
-router.post('/holidays', checkPermission('holidays', 'create'), createHoliday);
-router.put('/holidays/:id', checkPermission('holidays', 'edit'), updateHoliday);
-router.delete('/holidays/:id', checkPermission('holidays', 'delete'), deleteHoliday);
-
-// Benefit Plans
-router.get('/benefits', checkPermission('benefits_config', 'view'), getBenefitPlans);
-router.post('/benefits', checkPermission('benefits_config', 'create'), createBenefitPlan);
-router.put('/benefits/:id', checkPermission('benefits_config', 'edit'), updateBenefitPlan);
-router.delete('/benefits/:id', checkPermission('benefits_config', 'delete'), deleteBenefitPlan);
 
 module.exports = router;

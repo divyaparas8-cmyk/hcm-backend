@@ -51,7 +51,8 @@ const createJob = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     if (parsed.data.openings && typeof parsed.data.openings === 'string') {
@@ -232,7 +233,8 @@ const updateApplicationStatus = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     // Auto-promote logic when marked as HIRED
@@ -658,7 +660,8 @@ const onboardEmployee = async (req, res, next) => {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.errors[0].message } });
+      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
     const { email, password, role, fullName, employeeId, phone, departmentId, managerId, joiningDate } = parsed.data;
