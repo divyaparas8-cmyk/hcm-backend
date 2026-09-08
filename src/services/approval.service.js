@@ -1,0 +1,214 @@
+const prisma = require('../config/prisma');
+const { resolveApprover } = require('../utils/approval.utils');
+
+/**
+ * Gets the original requester's userId for a given entity.
+ */
+const getOriginalRequesterId = async (module, entityId) => {
+  if (module === 'LeaveRequest') {
+    const record = await prisma.leaveRequest.findUnique({ where: { id: entityId }, select: { userId: true } });
+    if (record) return record.userId;
+  } else if (module === 'SalaryIncrementRequest') {
+    const record = await prisma.salaryIncrementRequest.findUnique({ 
+      where: { id: entityId }, 
+      select: { employee: { select: { userId: true, manager: { select: { userId: true } } } } } 
+    });
+    if (record?.employee?.manager) {
+      return record.employee.manager.userId; // True requester is the manager initiating on behalf of employee
+    } else if (record?.employee) {
+      return record.employee.userId;
+    }
+  } else if (module === 'ExitLifecycle') {
+    const record = await prisma.exitLifecycle.findUnique({ 
+      where: { id: entityId }, 
+      select: { employee: { select: { userId: true } } } 
+    });
+    if (record?.employee) {
+      return record.employee.userId;
+    }
+  }
+  // Fallback for Phase 1 if the module isn't strictly defined
+  throw new Error(`Could not determine original requester for module ${module}`);
+};
+
+/**
+ * Checks if a custom workflow is active for a given module and organization.
+ */
+const isWorkflowEnabled = async (module, organizationId) => {
+  try {
+    const workflow = await prisma.approvalWorkflow.findFirst({
+      where: { module, organizationId, isActive: true, status: 'Active' }
+    });
+    return !!workflow;
+  } catch (error) {
+    console.error(`[Approval Engine] Error checking workflow for ${module}:`, error);
+    return false; // Fallback to legacy logic on error
+  }
+};
+
+/**
+ * Initiates a workflow for a specific entity.
+ */
+const startWorkflow = async (module, entityId, organizationId, requesterUserId) => {
+  const workflow = await prisma.approvalWorkflow.findFirst({
+    where: { module, organizationId, isActive: true, status: 'Active' },
+    include: { steps: { orderBy: { sequence: 'asc' } } }
+  });
+
+  if (!workflow || workflow.steps.length === 0) {
+    throw new Error(`No active workflow found for module: ${module}`);
+  }
+
+  const firstStep = workflow.steps[0];
+  const approverId = await resolveApprover(firstStep, requesterUserId, organizationId);
+  const nextStepSequence = workflow.steps.length > 1 ? workflow.steps[1].sequence : null;
+
+  const log = await prisma.approvalLog.create({
+    data: {
+      entityId,
+      entityType: module,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      stepOrder: firstStep.sequence,
+      nextStep: nextStepSequence,
+      approverId,
+      status: 'Pending'
+    }
+  });
+
+  // Also log to AuditLog
+  await prisma.auditLog.create({
+    data: {
+      userId: requesterUserId,
+      action: 'WORKFLOW_STARTED',
+      details: `Started workflow for ${module} (Entity ID: ${entityId})`,
+      ipAddress: 'System Workflow'
+    }
+  });
+
+  return log;
+};
+
+/**
+ * Processes an approval or rejection.
+ */
+const processApproval = async (module, entityId, approverUserId, action, comments = '') => {
+  const currentLog = await prisma.approvalLog.findFirst({
+    where: { entityId, entityType: module, status: 'Pending' },
+    orderBy: { createdAt: 'desc' },
+    include: { approver: true }
+  });
+
+  if (!currentLog) {
+    throw new Error("No pending approval found for this entity.");
+  }
+
+  // Fetch user to check role bypass
+  const user = await prisma.user.findUnique({ where: { id: approverUserId } });
+  
+  // Fetch step config to see if the user's role matches the required role for this step
+  const stepConfig = await prisma.approvalStep.findFirst({
+    where: { workflowId: currentLog.workflowId, sequence: currentLog.stepOrder }
+  });
+
+  const isExactApprover = currentLog.approver.userId === approverUserId;
+  const isSuperAdmin = user?.role === 'SUPERADMIN';
+  const isAdmin = user?.role === 'ADMIN';
+  const isHR = user?.role === 'HR';
+  
+  const stepRequiredRole = stepConfig?.approverRole?.toUpperCase() || '';
+  // HR can override steps as long as they don't require Admin or Superadmin
+  const isHROverride = isHR && !['ADMIN', 'SUPERADMIN'].includes(stepRequiredRole);
+
+  if (!isExactApprover && !isSuperAdmin && !isAdmin && !isHROverride) {
+    const requiredRole = stepConfig?.approverRole || 'Designated Approver';
+    throw new Error(`Unauthorized approver. This step requires the explicitly assigned approver (or an override via HR/Admin/Superadmin).`);
+  }
+
+  const newStatus = action === 'APPROVE' ? 'Approved' : 'Rejected';
+
+  await prisma.approvalLog.update({
+    where: { id: currentLog.id },
+    data: { status: newStatus, comments }
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      userId: approverUserId,
+      action: `WORKFLOW_STEP_${action}`,
+      details: `Step ${currentLog.stepOrder} ${newStatus} for ${module} (Entity: ${entityId})`,
+      ipAddress: 'System Workflow'
+    }
+  });
+
+  if (action === 'REJECT') {
+    return { status: 'Rejected', finalized: true };
+  }
+
+  // If approved, evaluate the next step dynamically
+  const workflow = await prisma.approvalWorkflow.findUnique({
+    where: { id: currentLog.workflowId },
+    include: { steps: true }
+  });
+
+  const sortedSteps = workflow.steps.sort((a, b) => a.sequence - b.sequence);
+  const nextStepConfig = sortedSteps.find(s => s.sequence > currentLog.stepOrder);
+
+  if (nextStepConfig) {
+    // We need the original requester userId to resolve context correctly through the hierarchy
+    const originalRequesterId = await getOriginalRequesterId(module, entityId);
+    
+    // Fetch all previous approvers in this workflow instance to avoid assigning the same person twice
+    const previousLogs = await prisma.approvalLog.findMany({
+      where: { entityId, workflowId: workflow.id, entityType: module }
+    });
+    const previousApproverIds = previousLogs.map(l => l.approverId);
+
+    const nextApproverId = await resolveApprover(nextStepConfig, originalRequesterId, workflow.organizationId, previousApproverIds);
+
+    const nextNextStepConfig = sortedSteps.find(s => s.sequence > nextStepConfig.sequence);
+    const nextNextStepSeq = nextNextStepConfig ? nextNextStepConfig.sequence : null;
+
+    await prisma.approvalLog.create({
+      data: {
+        entityId,
+        entityType: module,
+        workflowId: workflow.id,
+        workflowVersion: workflow.version,
+        stepOrder: nextStepConfig.sequence,
+        previousStep: currentLog.stepOrder,
+        nextStep: nextNextStepSeq,
+        approverId: nextApproverId,
+        status: 'Pending'
+      }
+    });
+
+    return { status: 'Advanced', finalized: false, nextStepConfig };
+  }
+
+  return { status: 'Finalized', finalized: true };
+};
+
+const getApprovalHistory = async (module, entityId) => {
+  return await prisma.approvalLog.findMany({
+    where: { entityId, entityType: module },
+    orderBy: { createdAt: 'asc' },
+    include: { approver: { select: { fullName: true, employeeId: true } } }
+  });
+};
+
+const getCurrentStep = async (module, entityId) => {
+  return await prisma.approvalLog.findFirst({
+    where: { entityId, entityType: module, status: 'Pending' },
+    orderBy: { createdAt: 'desc' },
+    include: { approver: { select: { fullName: true, userId: true } } }
+  });
+};
+
+module.exports = {
+  isWorkflowEnabled,
+  startWorkflow,
+  processApproval,
+  getApprovalHistory,
+  getCurrentStep
+};

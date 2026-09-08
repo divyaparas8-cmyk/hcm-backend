@@ -1,0 +1,37 @@
+[
+  {
+    "id": "841561e1-fe41-41c0-9d85-6c15a39efbcd",
+    "userId": "c1017bd6-5cae-458f-a430-439127049325",
+    "subject": "VPN Connection Issues",
+    "category": "IT Support",
+    "priority": "High",
+    "status": "OPEN",
+    "createdAt": "2026-08-22T06:39:46.151Z",
+    "messages": [
+      {
+        "id": "66910284-2e8e-4c02-8f26-edf886b5c31f",
+        "ticketId": "841561e1-fe41-41c0-9d85-6c15a39efbcd",
+        "senderId": "c1017bd6-5cae-458f-a430-439127049325",
+        "text": "Here is the requested diagnostics log screenshot.",
+        "attachmentUrl": "https://ik.imagekit.io/hcmkiaan/hcm/tickets/diagnostics.png",
+        "createdAt": "2026-08-25T07:50:10.462Z"
+      },
+      {
+        "id": "9287ba35-984e-428a-8fe6-c8835127839d",
+        "ticketId": "841561e1-fe41-41c0-9d85-6c15a39efbcd",
+        "senderId": "c1017bd6-5cae-458f-a430-439127049325",
+        "text": "Here is the requested diagnostics log screenshot.",
+        "attachmentUrl": "https://ik.imagekit.io/hcmkiaan/hcm/tickets/diagnostics.png",
+        "createdAt": "2026-08-25T07:50:51.356Z"
+      },
+      {
+        "id": "f41391fa-1040-4600-a7ae-75aca049b7c6",
+        "ticketId": "841561e1-fe41-41c0-9d85-6c15a39efbcd",
+        "senderId": "c1017bd6-5cae-458f-a430-439127049325",
+        "text": "Unable to connect to the corporate VPN from home network.",
+        "attachmentUrl": null,
+        "createdAt": "2026-08-22T06:39:46.151Z"
+      }
+    ]
+  }
+]

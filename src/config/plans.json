@@ -1,0 +1,14 @@
+{
+  "FREE": {
+    "maxSeats": 5,
+    "features": ["ADD_EMPLOYEE", "VIEW_DASHBOARD"]
+  },
+  "PRO": {
+    "maxSeats": 50,
+    "features": ["ADD_EMPLOYEE", "VIEW_DASHBOARD", "PAYROLL", "AI_FEATURES"]
+  },
+  "ENTERPRISE": {
+    "maxSeats": 500,
+    "features": ["ADD_EMPLOYEE", "VIEW_DASHBOARD", "PAYROLL", "AI_FEATURES", "CUSTOM_REPORTS"]
+  }
+}

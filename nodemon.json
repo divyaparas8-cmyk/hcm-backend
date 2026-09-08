@@ -1,0 +1,14 @@
+{
+  "watch": [
+    "src/",
+    "app.js"
+  ],
+  "ignore": [
+    "public/**",
+    "public/uploads/**",
+    "src/data/**",
+    "scratch/**",
+    "*.log"
+  ],
+  "ext": "js,json"
+}
