@@ -43,14 +43,18 @@ const MODULE_ALIASES = {
   documents: ['documents'],
   profile: ['profile'],
   reports: ['reports', 'analytics'],
-  analytics: ['analytics', 'reports']
+  analytics: ['analytics', 'reports'],
+  interview_schedule: ['interview_schedule', 'interviews', 'my_applications', 'applications'],
+  interviews: ['interviews', 'interview_schedule', 'my_applications', 'applications'],
+  offers: ['offers', 'my_offers', 'applications', 'my_applications']
 };
 
 // Universal Self-Service modules accessible by ANY authenticated employee/manager/user
 const SELF_SERVICE_MODULES = [
   'profile', 'documents', 'attendance', 'leave', 'leaves', 'payroll', 
   'performance', 'tickets', 'help_desk', 'benefits', 'resignation', 
-  'notifications', 'policies', 'holidays', 'announcements', 'tasks', 'compliance'
+  'notifications', 'policies', 'holidays', 'announcements', 'tasks', 'compliance',
+  'interview_schedule', 'interviews', 'offers', 'my_offers'
 ];
 
 /**
@@ -95,8 +99,12 @@ const checkPermission = (module, action = 'view') => {
 
       // CANDIDATE role has clearance across candidate portal modules
       if (userRole === 'CANDIDATE') {
-        const candidateModules = ['browse_jobs', 'my_applications', 'profile', 'settings', 'offers', 'interviews', 'resume', 'notifications'];
-        if (candidateModules.includes(module)) {
+        const candidateModules = [
+          'browse_jobs', 'my_applications', 'profile', 'settings', 'offers', 
+          'interviews', 'interview_schedule', 'resume', 'resume_builder', 
+          'ai_score', 'notifications', 'dashboard'
+        ];
+        if (candidateModules.includes(module) || !module) {
           return next();
         }
       }

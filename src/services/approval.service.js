@@ -8,7 +8,7 @@ const getOriginalRequesterId = async (module, entityId) => {
   if (module === 'LeaveRequest') {
     const record = await prisma.leaveRequest.findUnique({ where: { id: entityId }, select: { userId: true } });
     if (record) return record.userId;
-  } else if (module === 'SalaryIncrementRequest') {
+  } else if (module === 'SalaryIncrementRequest' || module === 'SalaryIncrement') {
     const record = await prisma.salaryIncrementRequest.findUnique({ 
       where: { id: entityId }, 
       select: { employee: { select: { userId: true, manager: { select: { userId: true } } } } } 
@@ -26,8 +26,29 @@ const getOriginalRequesterId = async (module, entityId) => {
     if (record?.employee) {
       return record.employee.userId;
     }
+  } else if (module === 'Reimbursement' || module === 'BenefitClaim') {
+    const record = await prisma.benefitClaim.findUnique({
+      where: { id: entityId },
+      select: { employee: { select: { userId: true } } }
+    });
+    if (record?.employee) {
+      return record.employee.userId;
+    }
   }
-  // Fallback for Phase 1 if the module isn't strictly defined
+  
+  // Generic fallback if user profile exists
+  const anyLog = await prisma.approvalLog.findFirst({
+    where: { entityId, entityType: module },
+    orderBy: { createdAt: 'asc' }
+  });
+  if (anyLog) {
+    const approverProfile = await prisma.employeeProfile.findUnique({
+      where: { id: anyLog.approverId },
+      select: { userId: true }
+    });
+    if (approverProfile) return approverProfile.userId;
+  }
+
   throw new Error(`Could not determine original requester for module ${module}`);
 };
 
@@ -90,6 +111,77 @@ const startWorkflow = async (module, entityId, organizationId, requesterUserId) 
 };
 
 /**
+ * Helper to update underlying entities when approval state transitions.
+ */
+const updateUnderlyingEntity = async (module, entityId, state, action, comments, approverUserId) => {
+  try {
+    if (module === 'LeaveRequest') {
+      let status = 'Pending';
+      if (state === 'REJECTED') status = 'REJECTED';
+      else if (state === 'FINALIZED') status = 'APPROVED';
+      else if (state === 'ADVANCED') status = 'MANAGER_APPROVED';
+      await prisma.leaveRequest.update({
+        where: { id: entityId },
+        data: { status }
+      }).catch(err => console.warn('Leave status update warning:', err.message));
+    } else if (module === 'Reimbursement' || module === 'BenefitClaim') {
+      if (state === 'REJECTED') {
+        await prisma.benefitClaim.update({
+          where: { id: entityId },
+          data: {
+            overallStatus: 'Rejected',
+            finalApprovalStatus: 'Rejected',
+            status: 'Rejected',
+            finalApprovalComment: comments || 'Rejected via Approval Workflow'
+          }
+        }).catch(err => console.warn('Claim status update warning:', err.message));
+      } else if (state === 'FINALIZED') {
+        await prisma.benefitClaim.update({
+          where: { id: entityId },
+          data: {
+            overallStatus: 'Pending Payment',
+            finalApprovalStatus: 'Approved',
+            status: 'Approved',
+            finalApprovedAt: new Date(),
+            finalApprovalComment: comments || 'Approved via Approval Workflow'
+          }
+        }).catch(err => console.warn('Claim status update warning:', err.message));
+      } else if (state === 'ADVANCED') {
+        await prisma.benefitClaim.update({
+          where: { id: entityId },
+          data: {
+            overallStatus: 'Pending Final Approval',
+            managerStatus: 'Approved',
+            managerComment: comments || 'Approved step in Approval Workflow',
+            managerApprovedAt: new Date()
+          }
+        }).catch(err => console.warn('Claim status update warning:', err.message));
+      }
+    } else if (module === 'SalaryIncrementRequest' || module === 'SalaryIncrement') {
+      let status = 'PENDING';
+      if (state === 'REJECTED') status = 'REJECTED';
+      else if (state === 'FINALIZED') status = 'APPROVED';
+      else if (state === 'ADVANCED') status = 'PENDING_HR_APPROVAL';
+      await prisma.salaryIncrementRequest.update({
+        where: { id: entityId },
+        data: { status }
+      }).catch(err => console.warn('Salary increment update warning:', err.message));
+    } else if (module === 'ExitLifecycle') {
+      let status = 'PENDING_HR_APPROVAL';
+      if (state === 'REJECTED') status = 'REJECTED';
+      else if (state === 'FINALIZED') status = 'APPROVED';
+      else if (state === 'ADVANCED') status = 'PENDING_HR_APPROVAL';
+      await prisma.exitLifecycle.update({
+        where: { id: entityId },
+        data: { status }
+      }).catch(err => console.warn('Exit lifecycle update warning:', err.message));
+    }
+  } catch (err) {
+    console.error(`[Approval Engine] Error updating underlying entity for ${module} (${entityId}):`, err);
+  }
+};
+
+/**
  * Processes an approval or rejection.
  */
 const processApproval = async (module, entityId, approverUserId, action, comments = '') => {
@@ -142,6 +234,7 @@ const processApproval = async (module, entityId, approverUserId, action, comment
   });
 
   if (action === 'REJECT') {
+    await updateUnderlyingEntity(module, entityId, 'REJECTED', action, comments, approverUserId);
     return { status: 'Rejected', finalized: true };
   }
 
@@ -183,9 +276,11 @@ const processApproval = async (module, entityId, approverUserId, action, comment
       }
     });
 
+    await updateUnderlyingEntity(module, entityId, 'ADVANCED', action, comments, approverUserId);
     return { status: 'Advanced', finalized: false, nextStepConfig };
   }
 
+  await updateUnderlyingEntity(module, entityId, 'FINALIZED', action, comments, approverUserId);
   return { status: 'Finalized', finalized: true };
 };
 
@@ -212,3 +307,4 @@ module.exports = {
   getApprovalHistory,
   getCurrentStep
 };
+

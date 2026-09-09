@@ -9,6 +9,7 @@ router.use(protect);
 router.use(tenantGuard);
 // We'll require ADMIN or HR or SUPERADMIN for payroll config
 router.use(authorize('SUPERADMIN', 'ADMIN', 'HR'));
+router.use(subscriptionGuard('payroll_operations'));
 
 router.get('/', getSalaryStructures);
 router.post('/', createSalaryStructure);

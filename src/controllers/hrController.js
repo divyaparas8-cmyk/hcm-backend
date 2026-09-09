@@ -58,7 +58,12 @@ const createJob = async (req, res, next) => {
     if (parsed.data.openings && typeof parsed.data.openings === 'string') {
       parsed.data.openings = parseInt(parsed.data.openings, 10);
     }
-    const job = await prisma.jobPost.create({ data: parsed.data });
+    const job = await prisma.jobPost.create({
+      data: {
+        ...parsed.data,
+        organizationId: req.user?.organizationId || parsed.data.organizationId || null,
+      }
+    });
     return res.status(201).json({ success: true, data: job, message: 'Job posted successfully.' });
   } catch (err) { next(err); }
 };
@@ -1071,11 +1076,35 @@ const getAllLeaves = async (req, res, next) => {
 // GET /api/hr/tickets  (all support tickets)
 const getAllTickets = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const tickets = await prisma.supportTicket.findMany({
+      where: organizationId ? { user: { organizationId } } : {},
       include: {
-        user: { select: { email: true, employeeProfile: { select: { fullName: true } } } },
+        user: { 
+          select: { 
+            id: true, 
+            email: true, 
+            role: true, 
+            employeeProfile: { 
+              select: { 
+                fullName: true, 
+                avatarUrl: true, 
+                department: { select: { name: true } } 
+              } 
+            } 
+          } 
+        },
         messages: { 
-          include: { sender: { select: { email: true, role: true } } },
+          include: { 
+            sender: { 
+              select: { 
+                id: true, 
+                email: true, 
+                role: true, 
+                employeeProfile: { select: { fullName: true, avatarUrl: true } } 
+              } 
+            } 
+          },
           orderBy: { createdAt: 'asc' }
         },
       },
@@ -1089,23 +1118,38 @@ const getAllTickets = async (req, res, next) => {
 // POST /api/hr/tickets
 const createTicket = async (req, res, next) => {
   try {
-    const { to, subject, message } = req.body;
+    const { to, subject, message, category, priority } = req.body;
     if (!to || !subject || !message) {
       return res.status(400).json({ success: false, error: { message: 'Recipient, Subject and Message are required.' } });
     }
 
+    // Resolve 'to' (can be userId or employeeProfile.id)
+    let targetUserId = to;
+    const empProfile = await prisma.employeeProfile.findFirst({
+      where: { OR: [{ id: to }, { userId: to }] },
+      select: { userId: true }
+    });
+    if (empProfile && empProfile.userId) {
+      targetUserId = empProfile.userId;
+    }
+
     const ticket = await prisma.supportTicket.create({
       data: {
-        userId: to,
+        userId: targetUserId,
         subject,
-        category: 'General',
-        priority: 'Medium',
+        category: category || 'General',
+        priority: priority || 'Medium',
+        status: 'OPEN',
         messages: {
           create: {
             senderId: req.user.userId,
             text: message,
           }
         }
+      },
+      include: {
+        user: { select: { email: true, employeeProfile: { select: { fullName: true, avatarUrl: true } } } },
+        messages: { include: { sender: true } }
       }
     });
 
@@ -1125,6 +1169,13 @@ const replyTicket = async (req, res, next) => {
 
     const msg = await prisma.ticketMessage.create({
       data: { ticketId: req.params.id, senderId: req.user.userId, text: text || '', attachmentUrl: finalAttachmentUrl },
+      include: { sender: { select: { id: true, email: true, role: true, employeeProfile: { select: { fullName: true, avatarUrl: true } } } } }
+    });
+
+    // Bump updatedAt on parent ticket
+    await prisma.supportTicket.update({
+      where: { id: req.params.id },
+      data: { updatedAt: new Date() }
     });
 
     return res.status(201).json({ success: true, data: msg });

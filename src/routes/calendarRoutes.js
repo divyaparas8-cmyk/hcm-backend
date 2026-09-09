@@ -16,16 +16,18 @@ const {
   removeAssignment
 } = require('../controllers/calendarController');
 
+router.use(protect, tenantGuard, subscriptionGuard('shifts_calendars'));
+
 router.route('/')
-  .get(protect, tenantGuard, getAllCalendars)
-  .post(protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'), createCalendar);
+  .get(getAllCalendars)
+  .post(authorize('ADMIN', 'SUPERADMIN', 'HR'), createCalendar);
 
 router.route('/:id')
-  .get(protect, tenantGuard, getCalendarById)
-  .put(protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'), updateCalendar)
-  .delete(protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'), deleteCalendar);
+  .get(getCalendarById)
+  .put(authorize('ADMIN', 'SUPERADMIN', 'HR'), updateCalendar)
+  .delete(authorize('ADMIN', 'SUPERADMIN', 'HR'), deleteCalendar);
 
-router.post('/assign', protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'), assignCalendar);
-router.delete('/assignments/:id', protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'), removeAssignment);
+router.post('/assign', authorize('ADMIN', 'SUPERADMIN', 'HR'), assignCalendar);
+router.delete('/assignments/:id', authorize('ADMIN', 'SUPERADMIN', 'HR'), removeAssignment);
 
 module.exports = router;

@@ -116,7 +116,7 @@ const DEFAULT_ROLES = [
       payroll: ['view'],
       benefits: ['view', 'create'],
       documents: ['view', 'create'],
-      performance: ['view'],
+      performance: ['view', 'create', 'edit', 'delete'],
       help_desk: ['view', 'create'],
       compliance: ['view'],
       resignation: ['view', 'create'],

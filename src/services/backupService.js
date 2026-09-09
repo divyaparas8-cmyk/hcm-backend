@@ -333,8 +333,9 @@ const createZipArchive = (options = {}) => {
  * Execute the Backup Job in Background
  */
 const runBackupJob = async (jobId) => {
+  let job = null;
   try {
-    const job = await prisma.backupJob.findUnique({
+    job = await prisma.backupJob.findUnique({
       where: { id: jobId },
       include: { organization: true, createdByUser: true }
     });
@@ -482,7 +483,8 @@ All password hashes and platform credentials are safely omitted.
     // Calculate file size and SHA-256 checksum
     const stats = fs.statSync(zipPath);
     const checksum = await calculateFileChecksum(zipPath);
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days retention
+    const retentionDays = job.organization?.backupRetentionDays || 30;
+    const expiresAt = new Date(Date.now() + retentionDays * 24 * 60 * 60 * 1000);
 
     // Update job to COMPLETED
     await prisma.backupJob.update({
@@ -523,6 +525,17 @@ All password hashes and platform credentials are safely omitted.
         errorMessage: err.message || 'Failed to complete backup archive creation.'
       }
     }).catch(() => {});
+
+    if (job?.createdByUserId) {
+      await prisma.auditLog.create({
+        data: {
+          userId: job.createdByUserId,
+          action: 'BACKUP_FAILED',
+          details: `Backup archive failed: ${err.message || 'Unknown error'}`,
+          organizationId: job.organizationId
+        }
+      }).catch(() => {});
+    }
   }
 };
 

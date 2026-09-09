@@ -12,7 +12,7 @@ const prisma = require('../config/prisma');
  * Builds the complete org chart tree for a given organization.
  * @param {string} organizationId - The tenant organization ID.
  * @param {string|null} departmentId - Optional: load only a specific branch.
- * @returns {Object} { organization, tree }
+ * @returns {Object} { organization, tree, unassignedEmployees, stats }
  */
 const buildOrgChart = async (organizationId, departmentId = null) => {
   // 1. Fetch organization info
@@ -30,7 +30,7 @@ const buildOrgChart = async (organizationId, departmentId = null) => {
     throw new Error('Organization not found');
   }
 
-  // 2. Fetch all departments (2 queries total — this is query 1)
+  // 2. Fetch all departments (Query 1)
   const departmentWhere = { organizationId };
   const departments = await prisma.department.findMany({
     where: departmentWhere,
@@ -41,6 +41,7 @@ const buildOrgChart = async (organizationId, departmentId = null) => {
       head: true,
       color: true,
       status: true,
+      description: true,
       parentId: true,
       parent: true,
       _count: { select: { employees: true } },
@@ -48,7 +49,7 @@ const buildOrgChart = async (organizationId, departmentId = null) => {
     orderBy: { name: 'asc' },
   });
 
-  // 3. Fetch all employees with their user info and manager info (query 2)
+  // 3. Fetch all employees with user and manager info (Query 2)
   const employees = await prisma.employeeProfile.findMany({
     where: {
       user: { organizationId },
@@ -58,32 +59,47 @@ const buildOrgChart = async (organizationId, departmentId = null) => {
       fullName: true,
       avatarUrl: true,
       employeeId: true,
+      phone: true,
+      address: true,
+      bio: true,
+      joiningDate: true,
       departmentId: true,
       managerId: true,
       employmentType: true,
+      lifecycleStatus: true,
       user: {
         select: {
           id: true,
           email: true,
           role: true,
+          status: true,
         },
       },
       department: {
         select: {
           id: true,
           name: true,
+          code: true,
+          color: true,
         },
       },
       manager: {
         select: {
           id: true,
           fullName: true,
+          avatarUrl: true,
+          user: {
+            select: {
+              role: true,
+            },
+          },
         },
       },
     },
+    orderBy: { fullName: 'asc' },
   });
 
-  // 4. Build department tree using hash map — O(N)
+  // 4. Build department tree using hash map — O(N) with cycle detection
   const deptMap = new Map();
   const rootDepts = [];
 
@@ -97,25 +113,44 @@ const buildOrgChart = async (organizationId, departmentId = null) => {
       head: dept.head,
       color: dept.color || '#4f46e5',
       status: dept.status || 'Active',
+      description: dept.description || '',
       parentId: dept.parentId,
       parentName: dept.parent || 'Corporate',
       employeeCount: dept._count.employees,
       children: [],    // child departments
-      employees: [],   // direct employees in this department
+      employees: [],   // root-level employees in this department
+      allMembers: [],  // all employees assigned to this department
     });
+  }
+
+  // Detect and break circular parentId references in departments
+  for (const dept of departments) {
+    const visited = new Set([dept.id]);
+    let currParentId = dept.parentId;
+    while (currParentId && deptMap.has(currParentId)) {
+      if (visited.has(currParentId)) {
+        console.warn(`[orgChart] Circular parentId detected for department ${dept.name} (${dept.id}). Disconnecting.`);
+        const node = deptMap.get(dept.id);
+        if (node) node.parentId = null;
+        break;
+      }
+      visited.add(currParentId);
+      const parentNode = deptMap.get(currParentId);
+      currParentId = parentNode?.parentId;
+    }
   }
 
   // Link departments to their parents
   for (const dept of departments) {
     const node = deptMap.get(dept.id);
-    if (dept.parentId && deptMap.has(dept.parentId)) {
-      deptMap.get(dept.parentId).children.push(node);
+    if (node.parentId && deptMap.has(node.parentId)) {
+      deptMap.get(node.parentId).children.push(node);
     } else {
       rootDepts.push(node);
     }
   }
 
-  // 5. Build employee reporting tree within each department — O(N)
+  // 5. Build employee reporting tree within each department — O(N) with cycle detection
   const empMap = new Map();
 
   // Initialize employee nodes
@@ -125,24 +160,51 @@ const buildOrgChart = async (organizationId, departmentId = null) => {
       id: emp.id,
       employeeId: emp.employeeId,
       fullName: emp.fullName,
-      avatarUrl: emp.avatarUrl,
+      avatarUrl: emp.avatarUrl || null,
       email: emp.user?.email,
-      role: emp.user?.role,
-      employmentType: emp.employmentType,
+      role: emp.user?.role || 'Employee',
+      userStatus: emp.user?.status || 'Active',
+      phone: emp.phone || null,
+      address: emp.address || null,
+      bio: emp.bio || null,
+      joiningDate: emp.joiningDate,
+      employmentType: emp.employmentType || 'Full-time',
+      lifecycleStatus: emp.lifecycleStatus || 'ACTIVE',
       departmentId: emp.departmentId,
       departmentName: emp.department?.name || 'Unassigned',
+      departmentCode: emp.department?.code || null,
+      departmentColor: emp.department?.color || '#4f46e5',
       managerId: emp.managerId,
       managerName: emp.manager?.fullName || null,
+      managerRole: emp.manager?.user?.role || null,
+      managerAvatar: emp.manager?.avatarUrl || null,
       directReports: [],
     });
   }
 
+  // Detect and break circular managerId reporting chains
+  for (const emp of employees) {
+    const visited = new Set([emp.id]);
+    let currManagerId = emp.managerId;
+    while (currManagerId && empMap.has(currManagerId)) {
+      if (visited.has(currManagerId)) {
+        console.warn(`[orgChart] Circular reporting line detected for employee ${emp.fullName} (${emp.id}). Breaking loop.`);
+        const node = empMap.get(emp.id);
+        if (node) node.managerId = null;
+        break;
+      }
+      visited.add(currManagerId);
+      const managerNode = empMap.get(currManagerId);
+      currManagerId = managerNode?.managerId;
+    }
+  }
+
   // Build manager → reports tree
-  const rootEmployees = []; // employees with no manager or manager outside this org
+  const rootEmployees = []; // employees with no manager or manager not in this org
   for (const emp of employees) {
     const empNode = empMap.get(emp.id);
-    if (emp.managerId && empMap.has(emp.managerId)) {
-      empMap.get(emp.managerId).directReports.push(empNode);
+    if (empNode.managerId && empMap.has(empNode.managerId)) {
+      empMap.get(empNode.managerId).directReports.push(empNode);
     } else {
       rootEmployees.push(empNode);
     }
@@ -152,37 +214,69 @@ const buildOrgChart = async (organizationId, departmentId = null) => {
   for (const emp of employees) {
     const empNode = empMap.get(emp.id);
     if (emp.departmentId && deptMap.has(emp.departmentId)) {
+      const dept = deptMap.get(emp.departmentId);
+      // Track in allMembers list
+      dept.allMembers.push(empNode);
+
       // Only add root-level employees (no manager or manager in different dept)
-      // to department.employees to avoid duplicating them under both dept and manager
+      // to department.employees to avoid duplicate cards in the tree
       const isRootInDept = !emp.managerId || !empMap.has(emp.managerId) ||
         empMap.get(emp.managerId).departmentId !== emp.departmentId;
       if (isRootInDept) {
-        deptMap.get(emp.departmentId).employees.push(empNode);
+        dept.employees.push(empNode);
       }
     }
   }
 
   // 7. Handle unassigned employees (no department)
   const unassignedEmployees = rootEmployees.filter(e => !e.departmentId);
+  const allUnassigned = employees.filter(e => !e.departmentId).map(e => empMap.get(e.id));
+
+  // If unassigned employees exist and no specific department is filtered, add an "Unassigned Staff" branch
+  if (!departmentId && allUnassigned.length > 0) {
+    const unassignedNode = {
+      type: 'department',
+      id: 'unassigned-dept',
+      name: 'Unassigned Staff',
+      code: 'UNASSIGNED',
+      head: null,
+      color: '#64748b',
+      status: 'Active',
+      description: 'Staff members currently not assigned to a department',
+      parentId: null,
+      parentName: 'Corporate',
+      employeeCount: allUnassigned.length,
+      children: [],
+      employees: unassignedEmployees,
+      allMembers: allUnassigned,
+    };
+    rootDepts.push(unassignedNode);
+  }
 
   // If filtering by specific department, return just that branch
   if (departmentId && deptMap.has(departmentId)) {
     return {
       organization,
       tree: [deptMap.get(departmentId)],
-      unassignedEmployees,
+      unassignedEmployees: allUnassigned,
+      stats: {
+        totalDepartments: 1,
+        totalEmployees: deptMap.get(departmentId).allMembers.length,
+        rootDepartments: 1,
+        unassignedCount: allUnassigned.length,
+      },
     };
   }
 
   return {
     organization,
     tree: rootDepts,
-    unassignedEmployees,
+    unassignedEmployees: allUnassigned,
     stats: {
       totalDepartments: departments.length,
       totalEmployees: employees.length,
       rootDepartments: rootDepts.length,
-      unassignedCount: unassignedEmployees.length,
+      unassignedCount: allUnassigned.length,
     },
   };
 };

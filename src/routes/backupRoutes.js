@@ -6,6 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { protect, authorize } = require('../middlewares/authMiddleware');
 const tenantGuard = require('../middlewares/tenantGuard');
+const subscriptionGuard = require('../middlewares/subscriptionGuard');
 const {
   getAvailableModules,
   getBackupOverview,
@@ -25,8 +26,8 @@ const {
 // Public OAuth callback route (handled via browser redirect from Google)
 router.get('/google-drive/callback', handleGoogleDriveCallback);
 
-// Protected tenant backup routes
-router.use(protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'));
+// Protected tenant backup routes guarded by backup_center feature entitlement
+router.use(protect, tenantGuard, authorize('ADMIN', 'SUPERADMIN', 'HR'), subscriptionGuard('backup_center'));
 
 // Module & Overview info
 router.get('/modules', getAvailableModules);

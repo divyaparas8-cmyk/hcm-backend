@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const { handleBase64Field, isBase64DataUrl, uploadDocument: uploadDocumentService, saveToLocal } = require('../services/cloudUploadService');
 const calendarResolver = require('../utils/calendarResolver');
 const { isWorkflowEnabled, startWorkflow } = require('../services/approval.service');
+const { DEFAULT_ROLES } = require('../utils/roleSeeder');
 
 // ─────────────────────────────────────────
 // HELPER: Auto-provision Employee Profile
@@ -17,7 +18,7 @@ const getOrCreateProfile = async (userId) => {
   const profileInclude = {
     department: true,
     manager: { select: { fullName: true, employeeId: true } },
-    user: { select: { email: true, role: true } },
+    user: { select: { email: true, role: true, customRole: { select: { name: true } } } },
     shift: true,
     compensationProfile: true,
     skills: true,
@@ -73,6 +74,10 @@ const getOrCreateProfile = async (userId) => {
     profile.weekends = [{ dayOfWeek: 0, type: 'FullDay' }, { dayOfWeek: 6, type: 'FullDay' }];
   }
 
+  profile.designation = profile.user?.customRole?.name || profile.user?.role || 'EMPLOYEE';
+  profile.managerName = profile.manager?.fullName || null;
+  profile.departmentName = profile.department?.name || null;
+
   return profile;
 };
 
@@ -121,6 +126,22 @@ const updateProfile = async (req, res, next) => {
       { folder: 'hcm/proofs', filenamePrefix: 'edu_proof' }
     );
 
+    if (employeeId && employeeId.trim() !== profile.employeeId) {
+      const existingWithId = await prisma.employeeProfile.findFirst({
+        where: {
+          employeeId: employeeId.trim(),
+          ...(profile.organizationId ? { organizationId: profile.organizationId } : {}),
+          NOT: { userId: req.user.userId }
+        }
+      });
+      if (existingWithId) {
+        return res.status(400).json({
+          success: false,
+          error: { message: `Employee ID "${employeeId.trim()}" is already assigned to another team member.` }
+        });
+      }
+    }
+
     const updated = await prisma.employeeProfile.update({
       where: { userId: req.user.userId },
       data: {
@@ -143,13 +164,17 @@ const updateProfile = async (req, res, next) => {
         weeklySummary: weeklySummary !== undefined ? Boolean(weeklySummary) : undefined,
         employeeId: employeeId || undefined,
         joiningDate: joiningDate ? new Date(joiningDate) : undefined,
+        employmentType: req.body.employmentType || undefined,
       },
     });
 
     if (department) {
-      let dept = await prisma.department.findFirst({ where: { name: department } });
+      const cleanDept = department.trim();
+      let dept = await prisma.department.findFirst({
+        where: { name: cleanDept }
+      });
       if (!dept) {
-        dept = await prisma.department.create({ data: { name: department } });
+        dept = await prisma.department.create({ data: { name: cleanDept } });
       }
       await prisma.employeeProfile.update({
         where: { userId: req.user.userId },
@@ -157,28 +182,74 @@ const updateProfile = async (req, res, next) => {
       });
     }
 
-    if (managerName) {
-      const manager = await prisma.employeeProfile.findFirst({
-        where: { fullName: { equals: managerName, mode: 'insensitive' } }
-      });
-      if (manager) {
+    if (managerName !== undefined) {
+      const cleanMgr = (managerName || '').trim();
+      if (cleanMgr) {
+        let manager = await prisma.employeeProfile.findFirst({
+          where: { fullName: cleanMgr }
+        });
+        if (!manager) {
+          manager = await prisma.employeeProfile.findFirst({
+            where: { fullName: { contains: cleanMgr } }
+          });
+        }
+        if (manager) {
+          await prisma.employeeProfile.update({
+            where: { userId: req.user.userId },
+            data: { managerId: manager.id }
+          });
+        }
+      } else {
         await prisma.employeeProfile.update({
           where: { userId: req.user.userId },
-          data: { managerId: manager.id }
+          data: { managerId: null }
         });
       }
-    } else if (managerName === '') {
-      await prisma.employeeProfile.update({
-        where: { userId: req.user.userId },
-        data: { managerId: null }
-      });
     }
 
     if (role) {
-      await prisma.user.update({
-        where: { id: req.user.userId },
-        data: { role: role }
-      });
+      const cleanRole = role.trim();
+      const enumRoleCandidate = cleanRole.toUpperCase().replace(/[\s_-]+/g, '');
+      const validEnums = {
+        'SUPERADMIN': 'SUPERADMIN',
+        'ADMIN': 'ADMIN',
+        'HR': 'HR',
+        'MANAGER': 'MANAGER',
+        'EMPLOYEE': 'EMPLOYEE',
+        'CANDIDATE': 'CANDIDATE'
+      };
+
+      if (validEnums[enumRoleCandidate]) {
+        await prisma.user.update({
+          where: { id: req.user.userId },
+          data: { role: validEnums[enumRoleCandidate], customRoleId: null }
+        });
+      } else {
+        let customRole = await prisma.customRole.findFirst({
+          where: { name: cleanRole }
+        });
+        if (!customRole) {
+          try {
+            const empRole = DEFAULT_ROLES.find(r => r.inheritsFrom === 'EMPLOYEE');
+            customRole = await prisma.customRole.create({
+              data: {
+                name: cleanRole,
+                permissions: JSON.stringify(empRole?.permissions || {}),
+                inheritsFrom: 'EMPLOYEE',
+                isCustom: true
+              }
+            });
+          } catch (e) {
+            console.warn('Could not create custom role:', e.message);
+          }
+        }
+        if (customRole) {
+          await prisma.user.update({
+            where: { id: req.user.userId },
+            data: { customRoleId: customRole.id }
+          });
+        }
+      }
     }
 
     if (baseSalary !== undefined || annualCTC !== undefined) {
@@ -201,8 +272,17 @@ const updateProfile = async (req, res, next) => {
       });
     }
 
-    return res.status(200).json({ success: true, data: updated });
-  } catch (err) { next(err); }
+    const fullProfile = await getOrCreateProfile(req.user.userId);
+    return res.status(200).json({ success: true, data: fullProfile });
+  } catch (err) {
+    if (err.code === 'P2002') {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'The specified Employee ID is already in use by another team member.' }
+      });
+    }
+    next(err);
+  }
 };
 
 // ─────────────────────────────────────────
@@ -337,131 +417,393 @@ const clockOut = async (req, res, next) => {
 };
 
 // ─────────────────────────────────────────
-// 5. GET ATTENDANCE HISTORY  →  GET /api/employee/attendance
+// 4b. GET CURRENT ATTENDANCE  →  GET /api/attendance/current or /api/employee/attendance/current
 // ─────────────────────────────────────────
-const getAttendance = async (req, res, next) => {
+const getCurrentAttendance = async (req, res, next) => {
   try {
-    const logs = await prisma.attendanceLog.findMany({
-      where: { userId: req.user.userId },
+    const userId = req.user?.userId || req.user?.id;
+    const now = new Date();
+
+    // 1. Check for active clock-in session
+    const activeLog = await prisma.attendanceLog.findFirst({
+      where: { userId, clockOut: null },
       orderBy: { clockIn: 'desc' },
-      take: 30, // last 30 records
+      include: { shift: true }
     });
 
-    return res.status(200).json({ success: true, data: logs });
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+    // 2. Check for completed today's log if not currently active
+    const todayLog = await prisma.attendanceLog.findFirst({
+      where: {
+        userId,
+        clockIn: { gte: startOfToday, lte: endOfToday }
+      },
+      orderBy: { clockIn: 'desc' },
+      include: { shift: true }
+    });
+
+    // 3. Shift details
+    const empProfile = await prisma.employeeProfile.findUnique({
+      where: { userId },
+      include: { shift: true }
+    });
+    let shift = empProfile?.shift || activeLog?.shift || todayLog?.shift;
+    if (!shift) {
+      shift = await prisma.shift.findFirst({ where: { isDefault: true } });
+    }
+
+    let status = 'Not Clocked In';
+    let checkInTime = null;
+    let workingDuration = 0; // Duration in seconds
+    let mode = 'Office';
+    let isClockedIn = false;
+
+    if (activeLog) {
+      isClockedIn = true;
+      status = activeLog.status || 'Present';
+      checkInTime = activeLog.clockIn;
+      workingDuration = Math.max(0, Math.floor((now.getTime() - new Date(activeLog.clockIn).getTime()) / 1000));
+      mode = activeLog.mode || 'Office';
+    } else if (todayLog) {
+      isClockedIn = false;
+      status = todayLog.status || 'Present';
+      checkInTime = todayLog.clockIn;
+      if (todayLog.totalWorkedMin && todayLog.totalWorkedMin > 0) {
+        workingDuration = todayLog.totalWorkedMin * 60;
+      } else if (todayLog.clockIn && todayLog.clockOut) {
+        workingDuration = Math.max(0, Math.floor((new Date(todayLog.clockOut) - new Date(todayLog.clockIn)) / 1000));
+      }
+      mode = todayLog.mode || 'Office';
+    } else {
+      // Check if employee has approved leave today
+      const leaveToday = await prisma.leaveRequest.findFirst({
+        where: {
+          userId,
+          status: 'APPROVED',
+          startDate: { lte: endOfToday },
+          endDate: { gte: startOfToday }
+        }
+      });
+      if (leaveToday) {
+        status = 'Leave';
+      }
+    }
+
+    const payload = {
+      status,
+      checkInTime,
+      workingDuration,
+      mode,
+      isClockedIn,
+      shift,
+      todayLog: activeLog || todayLog || null,
+      serverTime: now.toISOString()
+    };
+
+    return res.status(200).json({
+      success: true,
+      ...payload,
+      data: payload
+    });
   } catch (err) { next(err); }
 };
 
 // ─────────────────────────────────────────
-// 6. GET LEAVES  →  GET /api/employee/leaves
+// 5. GET ATTENDANCE HISTORY  →  GET /api/attendance/history or /api/employee/attendance/history
+// ─────────────────────────────────────────
+const getAttendanceHistory = async (req, res, next) => {
+  try {
+    const userId = req.user?.userId || req.user?.id;
+    const { startDate, endDate, status, mode, month, year, search } = req.query;
+
+    const where = { userId };
+
+    if (startDate && endDate) {
+      const s = new Date(startDate);
+      s.setHours(0, 0, 0, 0);
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
+      where.clockIn = { gte: s, lte: e };
+    } else if (startDate) {
+      const s = new Date(startDate);
+      s.setHours(0, 0, 0, 0);
+      where.clockIn = { gte: s };
+    } else if (endDate) {
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
+      where.clockIn = { lte: e };
+    } else if (month !== undefined && year !== undefined) {
+      const y = parseInt(year, 10);
+      const m = parseInt(month, 10);
+      const validMonth = (m >= 1 && m <= 12) ? m - 1 : m;
+      const s = new Date(y, validMonth, 1, 0, 0, 0);
+      const e = new Date(y, validMonth + 1, 0, 23, 59, 59, 999);
+      where.clockIn = { gte: s, lte: e };
+    }
+
+    if (status && status !== 'All') {
+      where.status = status;
+    }
+
+    if (mode && mode !== 'All') {
+      where.mode = mode;
+    }
+
+    let logs = await prisma.attendanceLog.findMany({
+      where,
+      include: { shift: true },
+      orderBy: { clockIn: 'desc' },
+      take: 100
+    });
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      logs = logs.filter(l => 
+        (l.status && l.status.toLowerCase().includes(q)) ||
+        (l.mode && l.mode.toLowerCase().includes(q)) ||
+        (l.date && String(l.date).toLowerCase().includes(q))
+      );
+    }
+
+    // Calculate summary statistics
+    let presentDays = 0;
+    let lateDays = 0;
+    let totalWorkedMinutes = 0;
+    let overtimeLogs = 0;
+
+    logs.forEach(l => {
+      if (l.status === 'Present' || l.status === 'Late') {
+        presentDays += l.isHalfDay ? 0.5 : 1;
+      }
+      if (l.status === 'Late') {
+        lateDays += 1;
+      }
+      if (l.totalWorkedMin && l.totalWorkedMin > 0) {
+        totalWorkedMinutes += l.totalWorkedMin;
+      } else if (l.clockIn && l.clockOut) {
+        totalWorkedMinutes += Math.max(0, Math.floor((new Date(l.clockOut) - new Date(l.clockIn)) / 60000));
+      }
+      if ((l.overtimeMinutes && l.overtimeMinutes > 0) || (l.shift && l.totalWorkedMin > l.shift.workingHoursMin)) {
+        overtimeLogs += 1;
+      }
+    });
+
+    const totalWorkedHours = (totalWorkedMinutes / 60).toFixed(1);
+
+    // Fetch leaves & holidays for calendar view
+    const leaves = await prisma.leaveRequest.findMany({
+      where: {
+        userId,
+        status: 'APPROVED'
+      },
+      orderBy: { startDate: 'desc' }
+    });
+
+    const holidays = await prisma.holiday.findMany({
+      orderBy: { date: 'asc' }
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: logs,
+      logs,
+      summary: {
+        presentDays,
+        lateDays,
+        totalWorkedHours: parseFloat(totalWorkedHours),
+        totalWorkedMinutes,
+        overtimeLogs
+      },
+      leaves,
+      holidays
+    });
+  } catch (err) { next(err); }
+};
+
+const getAttendance = getAttendanceHistory;
+
+// ─────────────────────────────────────────
+// Helper: Calculate Leave Balance
+// ─────────────────────────────────────────
+const calculateLeaveBalance = async (userId, organizationId) => {
+  let policies = [];
+  if (organizationId) {
+    policies = await prisma.leavePolicy.findMany({
+      where: { organizationId }
+    });
+
+    if (policies.length === 0) {
+      const defaultPolicies = [
+        { name: 'Sick Leave', isPaid: true, yearlyAllowance: 12, organizationId },
+        { name: 'Annual Leave', isPaid: true, yearlyAllowance: 18, organizationId },
+        { name: 'Casual Leave', isPaid: true, yearlyAllowance: 6, organizationId },
+        { name: 'Maternity/Paternity Leave', isPaid: true, yearlyAllowance: 90, organizationId },
+        { name: 'Unpaid Leave', isPaid: false, yearlyAllowance: 0, organizationId },
+      ];
+      await prisma.leavePolicy.createMany({
+        data: defaultPolicies,
+        skipDuplicates: true
+      }).catch(() => {});
+      policies = await prisma.leavePolicy.findMany({
+        where: { organizationId }
+      });
+    }
+  }
+
+  const policyMap = {
+    'Sick Leave': 12,
+    'Annual Leave': 18,
+    'Casual Leave': 6,
+    'Maternity/Paternity Leave': 90,
+    'Unpaid Leave': 0
+  };
+  policies.forEach(p => {
+    policyMap[p.name] = p.yearlyAllowance;
+  });
+
+  const currentYear = new Date().getFullYear();
+  const allUserLeaves = await prisma.leaveRequest.findMany({
+    where: { userId }
+  });
+
+  const approvedThisYear = allUserLeaves.filter(l => {
+    const isApproved = l.status === 'APPROVED' || l.status === 'Approved';
+    const leaveYear = l.startDate ? new Date(l.startDate).getFullYear() : currentYear;
+    return isApproved && leaveYear === currentYear;
+  });
+
+  const usedMap = {};
+  approvedThisYear.forEach(l => {
+    const type = l.leaveType || 'Annual Leave';
+    usedMap[type] = (usedMap[type] || 0) + (Number(l.totalDays) || 0);
+  });
+
+  const sickAllowance = policyMap['Sick Leave'] ?? 12;
+  const annualAllowance = policyMap['Annual Leave'] ?? 18;
+  const casualAllowance = policyMap['Casual Leave'] ?? 6;
+
+  const sickUsed = usedMap['Sick Leave'] || 0;
+  const annualUsed = usedMap['Annual Leave'] || 0;
+  const casualUsed = usedMap['Casual Leave'] || 0;
+  const unpaidUsed = usedMap['Unpaid Leave'] || 0;
+
+  const details = policies.map(p => {
+    const used = usedMap[p.name] || 0;
+    return {
+      name: p.name,
+      allowance: p.yearlyAllowance,
+      used: used,
+      remaining: Math.max(0, p.yearlyAllowance - used),
+      isPaid: p.isPaid
+    };
+  });
+
+  const balance = {
+    sick: Math.max(0, sickAllowance - sickUsed),
+    sickTotal: sickAllowance,
+    sickUsed,
+    annual: Math.max(0, annualAllowance - annualUsed),
+    annualTotal: annualAllowance,
+    annualUsed,
+    casual: Math.max(0, casualAllowance - casualUsed),
+    casualTotal: casualAllowance,
+    casualUsed,
+    unpaid: unpaidUsed,
+    totalAllowance: sickAllowance + annualAllowance + casualAllowance,
+    totalUsed: sickUsed + annualUsed + casualUsed + unpaidUsed,
+    totalRemaining: Math.max(0, (sickAllowance + annualAllowance + casualAllowance) - (sickUsed + annualUsed + casualUsed)),
+    details
+  };
+
+  return { balance, policies, allLeaves: allUserLeaves };
+};
+
+// ─────────────────────────────────────────
+// 6a. GET LEAVE BALANCE  →  GET /api/employee/leaves/balance
+// ─────────────────────────────────────────
+const getLeaveBalance = async (req, res, next) => {
+  try {
+    const userId = req.user?.userId || req.user?.id;
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const { balance, policies } = await calculateLeaveBalance(userId, organizationId);
+
+    return res.status(200).json({
+      success: true,
+      balance,
+      data: balance,
+      policies
+    });
+  } catch (err) { next(err); }
+};
+
+// ─────────────────────────────────────────
+// 6b. GET LEAVES  →  GET /api/employee/leaves
 // ─────────────────────────────────────────
 const getLeaves = async (req, res, next) => {
   try {
     const userId = req.user?.userId || req.user?.id;
     const organizationId = req.user?.organizationId || req.tenant?.id;
+    const { status, search } = req.query;
 
-    const leaves = await prisma.leaveRequest.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    let policies = [];
-    if (organizationId) {
-      policies = await prisma.leavePolicy.findMany({
-        where: { organizationId }
-      });
-
-      if (policies.length === 0) {
-        const defaultPolicies = [
-          { name: 'Sick Leave', isPaid: true, yearlyAllowance: 12, organizationId },
-          { name: 'Annual Leave', isPaid: true, yearlyAllowance: 18, organizationId },
-          { name: 'Casual Leave', isPaid: true, yearlyAllowance: 6, organizationId },
-          { name: 'Maternity/Paternity Leave', isPaid: true, yearlyAllowance: 90, organizationId },
-          { name: 'Unpaid Leave', isPaid: false, yearlyAllowance: 0, organizationId },
-        ];
-        await prisma.leavePolicy.createMany({
-          data: defaultPolicies,
-          skipDuplicates: true
-        }).catch(() => {});
-        policies = await prisma.leavePolicy.findMany({
-          where: { organizationId }
-        });
+    const where = { userId };
+    if (status && status !== 'All') {
+      const upper = status.toUpperCase();
+      if (upper === 'PENDING') {
+        where.status = { in: ['PENDING', 'MANAGER_APPROVED'] };
+      } else if (upper === 'APPROVED') {
+        where.status = 'APPROVED';
+      } else if (upper === 'REJECTED') {
+        where.status = 'REJECTED';
+      } else if (upper === 'CANCELLED') {
+        where.status = 'CANCELLED';
       }
     }
 
-    const policyMap = {
-      'Sick Leave': 12,
-      'Annual Leave': 18,
-      'Casual Leave': 6,
-      'Maternity/Paternity Leave': 90,
-      'Unpaid Leave': 0
-    };
-    policies.forEach(p => {
-      policyMap[p.name] = p.yearlyAllowance;
+    let leaves = await prisma.leaveRequest.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
     });
 
-    const currentYear = new Date().getFullYear();
-    const approvedThisYear = leaves.filter(l => {
-      const isApproved = l.status === 'APPROVED' || l.status === 'Approved';
-      const leaveYear = l.startDate ? new Date(l.startDate).getFullYear() : currentYear;
-      return isApproved && leaveYear === currentYear;
-    });
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      leaves = leaves.filter(l => 
+        (l.reason && l.reason.toLowerCase().includes(q)) ||
+        (l.leaveType && l.leaveType.toLowerCase().includes(q))
+      );
+    }
 
-    const usedMap = {};
-    approvedThisYear.forEach(l => {
-      const type = l.leaveType || 'Annual Leave';
-      usedMap[type] = (usedMap[type] || 0) + (Number(l.totalDays) || 0);
-    });
+    const { balance, policies } = await calculateLeaveBalance(userId, organizationId);
 
-    const sickAllowance = policyMap['Sick Leave'] ?? 12;
-    const annualAllowance = policyMap['Annual Leave'] ?? 18;
-    const casualAllowance = policyMap['Casual Leave'] ?? 6;
-
-    const sickUsed = usedMap['Sick Leave'] || 0;
-    const annualUsed = usedMap['Annual Leave'] || 0;
-    const casualUsed = usedMap['Casual Leave'] || 0;
-    const unpaidUsed = usedMap['Unpaid Leave'] || 0;
-
-    const details = policies.map(p => {
-      const used = usedMap[p.name] || 0;
-      return {
-        name: p.name,
-        allowance: p.yearlyAllowance,
-        used: used,
-        remaining: Math.max(0, p.yearlyAllowance - used),
-        isPaid: p.isPaid
-      };
-    });
-
-    const balance = {
-      sick: Math.max(0, sickAllowance - sickUsed),
-      sickTotal: sickAllowance,
-      sickUsed,
-      annual: Math.max(0, annualAllowance - annualUsed),
-      annualTotal: annualAllowance,
-      annualUsed,
-      casual: Math.max(0, casualAllowance - casualUsed),
-      casualTotal: casualAllowance,
-      casualUsed,
-      unpaid: unpaidUsed,
-      totalAllowance: sickAllowance + annualAllowance + casualAllowance,
-      totalUsed: sickUsed + annualUsed + casualUsed + unpaidUsed,
-      totalRemaining: Math.max(0, (sickAllowance + annualAllowance + casualAllowance) - (sickUsed + annualUsed + casualUsed)),
-      details
-    };
+    const formattedLeaves = leaves.map(l => ({
+      ...l,
+      type: l.leaveType,
+      days: l.totalDays,
+      status: l.status === 'APPROVED' ? 'Approved' :
+              l.status === 'REJECTED' ? 'Rejected' :
+              l.status === 'CANCELLED' ? 'Cancelled' :
+              l.status === 'MANAGER_APPROVED' ? 'Pending HR' : 'Pending'
+    }));
 
     return res.status(200).json({
       success: true,
       data: {
-        requests: leaves,
+        requests: formattedLeaves,
+        leaves: formattedLeaves,
         policies,
         balance
-      }
+      },
+      requests: formattedLeaves,
+      leaves: formattedLeaves,
+      balance,
+      policies
     });
   } catch (err) { next(err); }
 };
 
 // ─────────────────────────────────────────
-// 7. APPLY LEAVE  →  POST /api/employee/leaves
+// 7. APPLY / REQUEST LEAVE  →  POST /api/employee/leaves/request or /api/employee/leaves
 // ─────────────────────────────────────────
 const applyLeave = async (req, res, next) => {
   try {
@@ -469,15 +811,10 @@ const applyLeave = async (req, res, next) => {
       leaveType: z.string().min(1),
       startDate: z.string(),
       endDate: z.string(),
-      totalDays: z.number().min(1),
+      totalDays: z.number().optional(),
       reason: z.string().optional(),
       emergencyContact: z.string().optional(),
-      attachment: z.object({
-        url: z.string().optional(),
-        fileBase64: z.string().optional(),
-        name: z.string().optional(),
-        size: z.string().optional(),
-      }).optional().nullable(),
+      attachment: z.any().optional().nullable(),
     });
 
     const parsed = schema.safeParse(req.body);
@@ -506,28 +843,11 @@ const applyLeave = async (req, res, next) => {
       return res.status(404).json({ success: false, error: { message: 'Employee profile not found.' } });
     }
 
-    // --- INTEGRATE ENTERPRISE CALENDAR FOR LEAVE CALCULATION ---
-    let calculatedDays = 0;
-    try {
+    // Calculate totalDays if omitted or verify
+    let calculatedDays = parsed.data.totalDays;
+    if (!calculatedDays || calculatedDays <= 0) {
       const msPerDay = 1000 * 60 * 60 * 24;
-      const daysCount = Math.ceil((endDateObj - startDateObj) / msPerDay) + 1;
-      
-      for (let i = 0; i < daysCount; i++) {
-        const currentDate = new Date(startDateObj.getTime() + (i * msPerDay));
-        const dayType = await calendarResolver.getDayType(empProfile.id, currentDate);
-        
-        // This simulates a policy where FULL weekends and holidays don't consume leave balance.
-        // In a full implementation, we would query the specific LeavePolicy here.
-        if (dayType.type === 'WORKING_DAY') {
-          calculatedDays += 1;
-        } else if (dayType.type === 'WEEKEND' && dayType.detail.type === 'HALF_DAY') {
-          calculatedDays += 0.5; // Half day weekend still consumes 0.5 leave
-        }
-        // Holidays and FULL_DAY weekends add 0 to calculatedDays.
-      }
-    } catch (err) {
-      console.warn(`[Leave Calendar Warning] Failed to resolve calendar for ${req.user.userId}, defaulting to frontend totalDays. Error: ${err.message}`);
-      calculatedDays = parsed.data.totalDays;
+      calculatedDays = Math.ceil((endDateObj - startDateObj) / msPerDay) + 1;
     }
 
     if (calculatedDays <= 0) {
@@ -567,11 +887,19 @@ const applyLeave = async (req, res, next) => {
         });
       }
     }
-    // ------------------------------------------------------------
 
     // Extract optional attachment fields
     const { attachment, ...leavePayload } = parsed.data;
-    let attachmentUrl = attachment?.url || attachment?.fileBase64 || null;
+    let attachmentUrl = null;
+    let attachmentName = null;
+
+    if (typeof attachment === 'string') {
+      attachmentUrl = attachment;
+    } else if (attachment && typeof attachment === 'object') {
+      attachmentUrl = attachment.url || attachment.fileBase64 || null;
+      attachmentName = attachment.name || null;
+    }
+
     if (attachmentUrl && typeof attachmentUrl === 'string' && attachmentUrl.startsWith('data:')) {
       try {
         attachmentUrl = await handleBase64Field(attachmentUrl, null, { folder: 'hcm/leaves', filenamePrefix: 'leave' });
@@ -579,7 +907,7 @@ const applyLeave = async (req, res, next) => {
         console.warn('Failed to upload leave attachment to cloud, storing as data URI:', uploadErr.message);
       }
     }
-    const attachmentName = attachment?.name || null;
+
     const leave = await prisma.leaveRequest.create({
       data: {
         userId: req.user.userId,
@@ -594,8 +922,7 @@ const applyLeave = async (req, res, next) => {
     });
 
     try {
-      // --- GENERIC APPROVAL ENGINE INTEGRATION ---
-      const orgId = req.user.organizationId; // Or fetch from user profile if missing
+      const orgId = req.user.organizationId;
       const workflowActive = await isWorkflowEnabled('LeaveRequest', orgId);
 
       if (workflowActive) {
@@ -603,18 +930,16 @@ const applyLeave = async (req, res, next) => {
         return res.status(201).json({ success: true, data: leave, message: 'Leave request submitted and workflow started.' });
       }
     } catch (engineErr) {
-      console.warn(`[Leave Workflow Fallback] Error starting generic workflow, falling back to legacy: ${engineErr.message}`);
+      console.warn(`[Leave Workflow Fallback] Error starting generic workflow: ${engineErr.message}`);
     }
-    // -------------------------------------------
 
     try {
       const { createNotification } = require('../utils/notificationHelper');
-      
       if (empProfile && empProfile.manager?.userId) {
         await createNotification({
           userId: empProfile.manager.userId,
           title: 'Leave Approval Pending',
-          message: `${empProfile.fullName} requested ${parsed.data.totalDays} days of ${parsed.data.leaveType}.`,
+          message: `${empProfile.fullName} requested ${calculatedDays} days of ${parsed.data.leaveType}.`,
           type: 'WARNING',
           link: '/manager/leave'
         });
@@ -623,12 +948,12 @@ const applyLeave = async (req, res, next) => {
       console.error('Failed to trigger leave application notification:', notifErr);
     }
 
-    return res.status(201).json({ success: true, data: leave, message: 'Leave request submitted.' });
+    return res.status(201).json({ success: true, data: leave, message: 'Leave request submitted successfully.' });
   } catch (err) { next(err); }
 };
 
 // ─────────────────────────────────────────
-// 7b. CANCEL LEAVE  →  DELETE /api/employee/leaves/:id
+// 7b. CANCEL LEAVE  →  DELETE /api/employee/leaves/:id or PATCH /api/employee/leaves/:id/cancel
 // ─────────────────────────────────────────
 const cancelLeave = async (req, res, next) => {
   try {
@@ -636,20 +961,23 @@ const cancelLeave = async (req, res, next) => {
     const leave = await prisma.leaveRequest.findUnique({ where: { id: leaveId } });
 
     if (!leave) {
-      return res.status(404).json({ success: false, error: { message: 'Leave not found' } });
+      return res.status(404).json({ success: false, error: { message: 'Leave request not found.' } });
     }
 
     if (leave.userId !== req.user.userId) {
-      return res.status(403).json({ success: false, error: { message: 'Not authorized' } });
+      return res.status(403).json({ success: false, error: { message: 'Not authorized.' } });
     }
 
-    if (leave.status !== 'PENDING') {
-      return res.status(400).json({ success: false, error: { message: 'Only pending leaves can be cancelled' } });
+    if (leave.status !== 'PENDING' && leave.status !== 'MANAGER_APPROVED') {
+      return res.status(400).json({ success: false, error: { message: 'Only pending leaves can be cancelled.' } });
     }
 
-    await prisma.leaveRequest.delete({ where: { id: leaveId } });
+    const updated = await prisma.leaveRequest.update({
+      where: { id: leaveId },
+      data: { status: 'CANCELLED' }
+    });
 
-    return res.status(200).json({ success: true, message: 'Leave request cancelled' });
+    return res.status(200).json({ success: true, data: updated, message: 'Leave request cancelled successfully.' });
   } catch (err) { next(err); }
 };
 
@@ -802,20 +1130,26 @@ const getTickets = async (req, res, next) => {
 // ─────────────────────────────────────────
 const createTicket = async (req, res, next) => {
   try {
+    const rawBody = { ...req.body };
+    if (!rawBody.subject) {
+      rawBody.subject = rawBody.title || (rawBody.description ? rawBody.description.slice(0, 45).trim() : `${rawBody.category || 'General'} Support Request`);
+    }
+
     const schema = z.object({
-      subject: z.string().min(3),
-      category: z.string(),
-      priority: z.enum(['High', 'Medium', 'Low']),
-      description: z.string().min(5),
+      subject: z.string().min(1),
+      category: z.string().default('General'),
+      priority: z.enum(['High', 'Medium', 'Low']).or(z.string()).default('Medium'),
+      description: z.string().min(1),
       attachmentBase64: z.string().optional().nullable(),
       attachmentUrl: z.string().optional().nullable(),
     });
 
-    const parsed = schema.safeParse(req.body);
+    const parsed = schema.safeParse(rawBody);
     if (!parsed.success) {
       const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
       return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
+
 
     let attachmentUrl = parsed.data.attachmentUrl || null;
     if (parsed.data.attachmentBase64) {
@@ -904,6 +1238,35 @@ const deleteTicketMessage = async (req, res, next) => {
     return res.status(200).json({ success: true, message: 'Message deleted' });
   } catch (err) { next(err); }
 };
+
+const updateTicketStatus = async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    if (!status) return res.status(400).json({ success: false, error: { message: 'Status is required' } });
+
+    const ticket = await prisma.supportTicket.findUnique({ where: { id: req.params.id } });
+    if (!ticket) return res.status(404).json({ success: false, error: { message: 'Ticket not found' } });
+    if (ticket.userId !== req.user.userId) return res.status(403).json({ success: false, error: { message: 'Unauthorized' } });
+
+    const updated = await prisma.supportTicket.update({
+      where: { id: req.params.id },
+      data: { status: status.toUpperCase() },
+      include: {
+        messages: {
+          include: {
+            sender: {
+              select: { email: true, role: true, employeeProfile: { select: { fullName: true } } }
+            }
+          },
+          orderBy: { createdAt: 'asc' }
+        }
+      }
+    });
+
+    return res.status(200).json({ success: true, data: updated, message: `Ticket status updated to ${status}` });
+  } catch (err) { next(err); }
+};
+
 
 // ─────────────────────────────────────────
 // 12. BENEFIT CLAIMS  →  GET /api/employee/benefits
@@ -1184,8 +1547,20 @@ const submitBenefitClaim = async (req, res, next) => {
       }
     });
 
-    // Notify Manager if required
-    if (requireManagerApproval && profile.managerId) {
+    // Check if generic Approval Workflow is enabled for Reimbursement
+    const orgId = req.user?.organizationId || (await prisma.organization.findFirst())?.id;
+    const hasReimbursementWorkflow = orgId ? await isWorkflowEnabled('Reimbursement', orgId) : false;
+    const hasBenefitClaimWorkflow = orgId ? await isWorkflowEnabled('BenefitClaim', orgId) : false;
+
+    if (hasReimbursementWorkflow || hasBenefitClaimWorkflow) {
+      const targetModule = hasReimbursementWorkflow ? 'Reimbursement' : 'BenefitClaim';
+      try {
+        await startWorkflow(targetModule, claim.id, orgId, req.user.userId);
+      } catch (wfErr) {
+        console.warn(`[Approval Workflow] Could not start workflow for claim ${claim.id}:`, wfErr.message);
+      }
+    } else if (requireManagerApproval && profile.managerId) {
+      // Fallback to legacy manager notification if generic workflow is not configured
       const managerUser = await prisma.employeeProfile.findUnique({
         where: { id: profile.managerId },
         select: { userId: true }
@@ -1537,6 +1912,33 @@ const deleteSkill = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+const requestPerformanceReview = async (req, res, next) => {
+  try {
+    const profile = await getOrCreateProfile(req.user.userId);
+    const { message } = req.body || {};
+
+    if (profile.managerId) {
+      const manager = await prisma.employeeProfile.findUnique({ where: { id: profile.managerId } });
+      if (manager && manager.userId) {
+        await prisma.notification.create({
+          data: {
+            userId: manager.userId,
+            title: 'Performance Review Requested',
+            message: `${profile.fullName || 'An employee'} requested a 360-degree performance evaluation: ${message || 'No additional message.'}`,
+            type: 'INFO'
+          }
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Performance review request submitted successfully to management.'
+    });
+  } catch (err) { next(err); }
+};
+
+
 const submitResignation = async (req, res, next) => {
   try {
     const { reason, lastWorkingDay } = req.body;
@@ -1580,7 +1982,8 @@ const getResignation = async (req, res, next) => {
     });
     if (!emp) return res.status(404).json({ success: false, error: { message: 'Employee profile not found.' } });
 
-    const resignation = await prisma.exitLifecycle.findFirst({
+    // Return all resignation history, most recent first
+    const resignations = await prisma.exitLifecycle.findMany({
       where: {
         employeeId: emp.id,
         exitType: 'RESIGNATION'
@@ -1588,18 +1991,28 @@ const getResignation = async (req, res, next) => {
       orderBy: { submissionDate: 'desc' }
     });
 
-    if (!resignation) {
-      return res.status(200).json({ success: true, data: null, message: 'No resignation found.' });
-    }
+    // Active = not completed/cancelled/rejected
+    const activeStatuses = ['INITIATED', 'PENDING_MANAGER_APPROVAL', 'PENDING_HR_APPROVAL', 'APPROVED', 'CLEARANCE_IN_PROGRESS'];
+    const active = resignations.find(r => activeStatuses.includes(r.status)) || null;
 
-    return res.status(200).json({ success: true, data: resignation });
+    return res.status(200).json({
+      success: true,
+      data: {
+        active,
+        history: resignations
+      }
+    });
   } catch (err) { next(err); }
 };
+
 
 const getPolicies = async (req, res, next) => {
   try {
     const policies = await prisma.policy.findMany({
-      where: { status: 'Active' },
+      where: {
+        status: 'Active',
+        ...(req.tenant?.id ? { organizationId: req.tenant.id } : {})
+      },
       orderBy: { createdAt: 'desc' }
     });
 
@@ -1607,16 +2020,33 @@ const getPolicies = async (req, res, next) => {
       where: { userId: req.user.userId }
     });
 
-    const ackSet = new Set(acknowledgments.map(a => a.policyId));
+    // Map acknowledgment by policyId for O(1) lookup
+    const ackMap = new Map(acknowledgments.map(a => [a.policyId, a]));
 
-    const formattedPolicies = policies.map(p => ({
-      ...p,
-      hasAcknowledged: ackSet.has(p.id)
-    }));
+    const formattedPolicies = policies.map(p => {
+      const ack = ackMap.get(p.id);
+      return {
+        id: p.id,
+        name: p.name,
+        category: p.category,
+        department: p.department,
+        version: p.version,
+        description: p.description,
+        pdfName: p.pdfName,
+        pdfData: p.pdfData,
+        effectiveDate: p.effectiveDate,
+        requiresSignature: p.requiresSignature,
+        acknowledgments: p.acknowledgments,
+        createdAt: p.createdAt,
+        hasAcknowledged: Boolean(ack),
+        acknowledgedAt: ack?.createdAt || null,
+      };
+    });
 
     return res.status(200).json({ success: true, data: formattedPolicies });
   } catch (err) { next(err); }
 };
+
 
 const acknowledgePolicy = async (req, res, next) => {
   try {
@@ -1662,15 +2092,372 @@ const acknowledgePolicy = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+// ─────────────────────────────────────────
+// 17. GET EMPLOYEE DASHBOARD  →  GET /api/employee/dashboard
+// ─────────────────────────────────────────
+const getEmployeeDashboard = async (req, res, next) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+    const profile = await getOrCreateProfile(userId);
+    const now = new Date();
+
+    // 1. Employee Info
+    const employee = {
+      id: profile.id,
+      userId: profile.userId,
+      name: profile.fullName || 'Employee',
+      avatar: profile.avatarUrl || null,
+      designation: profile.designation || profile.user?.role || 'Staff Associate',
+      department: profile.department?.name || profile.department || 'Operations',
+      employeeCode: profile.employeeId || 'EMP-001',
+      shift: profile.shift?.name || 'Morning Shift',
+      shiftDetails: profile.shift || null,
+      baseSalary: profile.baseSalary || 10000,
+    };
+
+    // 2. Attendance Status & Timer Data
+    const activeLog = await prisma.attendanceLog.findFirst({
+      where: { userId, clockOut: null },
+      orderBy: { clockIn: 'desc' },
+      include: { shift: true }
+    });
+
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+    const todayLog = await prisma.attendanceLog.findFirst({
+      where: {
+        userId,
+        clockIn: { gte: startOfToday, lte: endOfToday }
+      },
+      orderBy: { clockIn: 'desc' },
+      include: { shift: true }
+    });
+
+    // Calculate current week (Monday to Friday)
+    const toLocalDateStr = (d) => {
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    };
+
+    const currentDay = now.getDay(); // 0 is Sun, 1 is Mon...
+    const diffToMon = currentDay === 0 ? 6 : currentDay - 1;
+    const mondayOfWeek = new Date(now);
+    mondayOfWeek.setDate(now.getDate() - diffToMon);
+    mondayOfWeek.setHours(0, 0, 0, 0);
+
+    const endOfWeek = new Date(mondayOfWeek);
+    endOfWeek.setDate(mondayOfWeek.getDate() + 6);
+    endOfWeek.setHours(23, 59, 59, 999);
+
+    const weekLogs = await prisma.attendanceLog.findMany({
+      where: {
+        userId,
+        clockIn: { gte: mondayOfWeek, lte: endOfWeek }
+      },
+      orderBy: { clockIn: 'asc' }
+    });
+
+    const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
+    const weeklyHours = weekdays.map((day, idx) => {
+      const targetDate = new Date(mondayOfWeek);
+      targetDate.setDate(mondayOfWeek.getDate() + idx);
+      const targetDateStr = toLocalDateStr(targetDate);
+
+      const dayLogs = weekLogs.filter(log => {
+        const logDateStr = toLocalDateStr(new Date(log.clockIn));
+        return logDateStr === targetDateStr;
+      });
+
+      let totalMin = 0;
+      dayLogs.forEach(l => {
+        if (l.totalWorkedMin && l.totalWorkedMin > 0) {
+          totalMin += l.totalWorkedMin;
+        } else if (l.clockIn && l.clockOut) {
+          totalMin += Math.max(0, Math.floor((new Date(l.clockOut) - new Date(l.clockIn)) / 60000));
+        } else if (l.clockIn && !l.clockOut) {
+          totalMin += Math.max(0, Math.floor((Date.now() - new Date(l.clockIn).getTime()) / 60000));
+        }
+      });
+
+      const hours = parseFloat((totalMin / 60).toFixed(1));
+      return {
+        day,
+        hours,
+        date: targetDateStr,
+        logged: dayLogs.length > 0
+      };
+    });
+
+    const isClockedIn = Boolean(activeLog);
+    const clockInTime = activeLog ? activeLog.clockIn : (todayLog ? todayLog.clockIn : null);
+    const clockOutTime = activeLog ? null : (todayLog ? todayLog.clockOut : null);
+
+    let totalWorkedSeconds = 0;
+    if (isClockedIn && clockInTime) {
+      totalWorkedSeconds = Math.max(0, Math.floor((Date.now() - new Date(clockInTime).getTime()) / 1000));
+    } else if (todayLog) {
+      if (todayLog.totalWorkedMin) {
+        totalWorkedSeconds = todayLog.totalWorkedMin * 60;
+      } else if (todayLog.clockIn && todayLog.clockOut) {
+        totalWorkedSeconds = Math.max(0, Math.floor((new Date(todayLog.clockOut) - new Date(todayLog.clockIn)) / 1000));
+      }
+    }
+
+    const attendance = {
+      isClockedIn,
+      clockInTime,
+      clockOutTime,
+      mode: activeLog?.mode || todayLog?.mode || 'Office-Based',
+      workedSeconds: totalWorkedSeconds,
+      totalHoursToday: parseFloat((totalWorkedSeconds / 3600).toFixed(2)),
+      today: activeLog || todayLog || null,
+      weeklyHours,
+      weeklyActivity: weeklyHours,
+      history: weekLogs
+    };
+
+    // 3. Leave Balance & Recent Requests
+    const leaves = await prisma.leaveRequest.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const currentYear = now.getFullYear();
+    const approvedThisYear = leaves.filter(l => {
+      const isApproved = l.status === 'APPROVED' || l.status === 'Approved';
+      const leaveYear = l.startDate ? new Date(l.startDate).getFullYear() : currentYear;
+      return isApproved && leaveYear === currentYear;
+    });
+
+    const usedMap = {};
+    approvedThisYear.forEach(l => {
+      const type = l.leaveType || 'Annual Leave';
+      usedMap[type] = (usedMap[type] || 0) + (Number(l.totalDays) || 0);
+    });
+
+    const sickAllowance = 12;
+    const annualAllowance = 18;
+    const casualAllowance = 6;
+    const sickUsed = usedMap['Sick Leave'] || 0;
+    const annualUsed = usedMap['Annual Leave'] || 0;
+    const casualUsed = usedMap['Casual Leave'] || 0;
+    const pendingRequests = leaves.filter(l => l.status === 'Pending' || l.status === 'PENDING').length;
+    const totalRemaining = Math.max(0, (sickAllowance + annualAllowance + casualAllowance) - (sickUsed + annualUsed + casualUsed));
+
+    const leaveBalance = {
+      total: totalRemaining,
+      annual: Math.max(0, annualAllowance - annualUsed),
+      sick: Math.max(0, sickAllowance - sickUsed),
+      casual: Math.max(0, casualAllowance - casualUsed),
+      pendingRequests,
+      recentRequests: leaves.slice(0, 5),
+      requests: leaves
+    };
+
+    // 4. Salary Status
+    const latestPayslip = await prisma.payslip.findFirst({
+      where: { employeeId: profile.id },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const netSalary = latestPayslip ? Number(latestPayslip.netSalary) : (Number(profile.baseSalary) || 10000);
+    const month = latestPayslip ? latestPayslip.month : now.toLocaleString('default', { month: 'long', year: 'numeric' });
+
+    const salary = {
+      netSalary,
+      baseSalary: Number(profile.baseSalary) || 10000,
+      month,
+      status: 'Payroll structure active',
+      latestPayslip: latestPayslip || null
+    };
+
+    // 5. Goals
+    let goals = await prisma.performanceGoal.findMany({
+      where: { employeeId: profile.id },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    if (goals.length === 0) {
+      await prisma.performanceGoal.createMany({
+        data: [
+          {
+            employeeId: profile.id,
+            title: 'Implement Core Architecture & Performance Benchmarks',
+            progress: 75,
+            priority: 'High'
+          },
+          {
+            employeeId: profile.id,
+            title: 'Lead Departmental Knowledge Transfer & Mentorship',
+            progress: 100,
+            priority: 'Low'
+          },
+          {
+            employeeId: profile.id,
+            title: 'Automate CI/CD & Unit Test Suite Coverage',
+            progress: 45,
+            priority: 'Medium'
+          }
+        ]
+      });
+      goals = await prisma.performanceGoal.findMany({
+        where: { employeeId: profile.id },
+        orderBy: { createdAt: 'desc' }
+      });
+    }
+
+    // 6. Assigned Tasks
+    const tasks = await prisma.task.findMany({
+      where: { employeeId: profile.id },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    // 7. Announcements
+    let announcements = await prisma.announcement.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 10
+    });
+
+    if (announcements.length === 0) {
+      await prisma.announcement.createMany({
+        data: [
+          {
+            title: 'New Health Insurance Policy',
+            date: 'Oct 22',
+            category: 'Updates',
+            priority: 'medium',
+            content: 'Our health insurance provider has been updated to Blue Cross Premium. Please review the new policy documents in the Benefits section for details on coverage and benefits.'
+          },
+          {
+            title: 'WFH Policy Update',
+            date: 'Oct 15',
+            category: 'HR',
+            priority: 'low',
+            content: 'Starting next month, our flexible work policy will allow for up to 3 days of remote work per week. Please coordinate with your manager for scheduling.'
+          },
+          {
+            title: 'Annual Team Building Retreat',
+            date: 'Oct 28',
+            category: 'Events',
+            priority: 'high',
+            content: 'We are excited to announce our annual team building retreat! Join us for a weekend of fun, collaboration, and networking at the Mountain Resort. Transportation and accommodation will be provided.'
+          }
+        ]
+      });
+      announcements = await prisma.announcement.findMany({
+        orderBy: { createdAt: 'desc' },
+        take: 10
+      });
+    }
+
+    // 8. Holidays
+    const holidays = await prisma.holiday.findMany({
+      orderBy: { date: 'asc' }
+    });
+
+    const nextHoliday = holidays.find(h => new Date(h.date) >= now) || holidays[0] || null;
+
+    const payload = {
+      employee,
+      attendance,
+      leaveBalance,
+      salary,
+      goals,
+      tasks,
+      announcements,
+      holidays,
+      nextHoliday
+    };
+
+    return res.status(200).json({
+      success: true,
+      data: payload,
+      ...payload
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// SETTINGS  →  GET/PUT /api/employee/settings
+// ─────────────────────────────────────────────────────────
+const getSettings = async (req, res, next) => {
+  try {
+    const profile = await getOrCreateProfile(req.user.userId);
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    return res.status(200).json({
+      success: true,
+      data: {
+        displayName: profile.fullName || user?.email?.split('@')[0] || '',
+        email: user?.email || '',
+        language: profile.language || 'English (US)',
+        timezone: profile.timezone || 'UTC+00:00 (London)',
+        dateFormat: profile.dateFormat || 'DD/MM/YYYY',
+        emailNotif: profile.emailNotif ?? true,
+        pushNotif: profile.pushNotif ?? true,
+        weeklySummary: profile.weeklySummary ?? true,
+      }
+    });
+  } catch (err) { next(err); }
+};
+
+const updateSettings = async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const displayName = body.displayName ?? body.fullName ?? body.general?.displayName ?? body.general?.fullname ?? body.general?.fullName;
+    const language = body.language ?? body.general?.language;
+    const timezone = body.timezone ?? body.general?.timezone;
+    const dateFormat = body.dateFormat ?? body.general?.dateFormat;
+    const emailNotif = body.emailNotif ?? body.notifications?.emailNotif ?? body.notifications?.emailAlerts;
+    const pushNotif = body.pushNotif ?? body.notifications?.pushNotif ?? body.notifications?.browserNotif ?? body.notifications?.pushNotifications;
+    const weeklySummary = body.weeklySummary ?? body.notifications?.weeklySummary;
+
+    await getOrCreateProfile(req.user.userId);
+    const updated = await prisma.employeeProfile.update({
+      where: { userId: req.user.userId },
+      data: {
+        ...(displayName !== undefined ? { fullName: displayName } : {}),
+        ...(language !== undefined ? { language } : {}),
+        ...(timezone !== undefined ? { timezone } : {}),
+        ...(dateFormat !== undefined ? { dateFormat } : {}),
+        ...(emailNotif !== undefined ? { emailNotif: Boolean(emailNotif) } : {}),
+        ...(pushNotif !== undefined ? { pushNotif: Boolean(pushNotif) } : {}),
+        ...(weeklySummary !== undefined ? { weeklySummary: Boolean(weeklySummary) } : {}),
+      }
+    });
+    return res.status(200).json({
+      success: true,
+      message: 'Settings updated successfully.',
+      data: {
+        displayName: updated.fullName,
+        language: updated.language,
+        timezone: updated.timezone,
+        dateFormat: updated.dateFormat,
+        emailNotif: updated.emailNotif,
+        pushNotif: updated.pushNotif,
+        weeklySummary: updated.weeklySummary,
+      }
+    });
+  } catch (err) { next(err); }
+};
+
 module.exports = {
+
   getProfile, updateProfile,
-  clockIn, clockOut, getAttendance,
-  getLeaves, applyLeave, cancelLeave,
-  getPayslips, getPerformance, createGoal, updateGoal, updateGoalProgress, deleteGoal, upsertSkill, deleteSkill,
-  getTickets, createTicket, replyTicket, deleteTicketMessage,
+  clockIn, clockOut, getAttendance, getCurrentAttendance, getAttendanceHistory,
+  getLeaves, getLeaveBalance, applyLeave, cancelLeave,
+  getPayslips, getPerformance, createGoal, updateGoal, updateGoalProgress, deleteGoal, upsertSkill, deleteSkill, requestPerformanceReview,
+  getTickets, createTicket, replyTicket, deleteTicketMessage, updateTicketStatus,
   getBenefits, submitBenefitClaim, getTasks,
   getHolidays, getAnnouncements,
   getDocuments, uploadDocument, deleteDocument,
   submitResignation, getResignation, enrollBenefitPlan, unenrollBenefitPlan,
-  getPolicies, acknowledgePolicy
+  getPolicies, acknowledgePolicy,
+  getSettings, updateSettings,
+  getEmployeeDashboard
 };
+

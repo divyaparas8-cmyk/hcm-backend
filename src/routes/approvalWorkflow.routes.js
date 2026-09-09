@@ -9,6 +9,7 @@ const subscriptionGuard = require('../middlewares/subscriptionGuard');
 // Require authentication for all workflow routes
 router.use(protect);
 router.use(tenantGuard);
+router.use(subscriptionGuard('approval_workflows'));
 
 // ─────────────────────────────────────────
 // Workflow Configuration Routes (Typically Admin/HR only)
@@ -18,6 +19,7 @@ router.get('/approval-workflows', approvalWorkflowController.getWorkflows);
 router.post('/approval-workflows', approvalWorkflowController.createWorkflow);
 router.get('/approval-workflows/module/:module', approvalWorkflowController.getWorkflowByModule);
 router.put('/approval-workflows/:id', approvalWorkflowController.updateWorkflow);
+router.patch('/approval-workflows/:id/status', approvalWorkflowController.toggleStatusWorkflow);
 router.put('/approval-workflows/:id/unarchive', approvalWorkflowController.unarchiveWorkflow);
 router.delete('/approval-workflows/:id', approvalWorkflowController.deleteWorkflow);
 router.delete('/approval-workflows/:id/hard', approvalWorkflowController.hardDeleteWorkflow);

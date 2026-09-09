@@ -82,13 +82,29 @@ const getDashboardStats = async (req, res, next) => {
         success: true,
         data: {
           totalEmployees: 0,
+          activeEmployees: 0,
           totalDepartments: 0,
+          customRoles: 0,
+          targetPayroll: 0,
+          complianceAlerts: 0,
           pendingLeaves: 0,
           openTickets: 0,
           todayAttendance: 0,
           unpaidPayslips: 0,
-          attendanceSummary: { present: '0%', onLeave: '0%', lateAbsent: '0%' },
+          attendanceSummary: {
+            present: '0%',
+            onLeave: '0%',
+            lateAbsent: '0%',
+            presentCount: 0,
+            onLeaveCount: 0,
+            lateAbsentCount: 0
+          },
           recentActivities: [],
+          growthTrend: {
+            '6months': [],
+            '12months': [],
+            'year2026': []
+          },
           organizationScore: 100
         },
       });
@@ -97,21 +113,41 @@ const getDashboardStats = async (req, res, next) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
+    const thirtyDaysFromNow = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
     const [
       totalEmployees,
+      activeEmployees,
       totalDepartments,
+      customRoles,
+      activeCompProfiles,
+      policies,
       pendingLeaves,
       openTickets,
       attendanceLogs,
       leavesToday,
       unpaidPayslips,
       recentActivities,
+      allOrgUsers,
     ] = await Promise.all([
-      prisma.employeeProfile.count({
-        where: { user: { organizationId, role: { notIn: ['SUPERADMIN'] } } }
+      prisma.user.count({
+        where: { organizationId, role: { notIn: ['SUPERADMIN', 'CANDIDATE'] } }
+      }),
+      prisma.user.count({
+        where: { organizationId, status: 'Active', role: { notIn: ['SUPERADMIN', 'CANDIDATE'] } }
       }),
       prisma.department.count({
         where: { organizationId }
+      }),
+      prisma.customRole.count({
+        where: { organizationId }
+      }),
+      prisma.employeeProfile.findMany({
+        where: { user: { organizationId, status: 'Active', role: { notIn: ['SUPERADMIN', 'CANDIDATE'] } } },
+        include: { compensationProfile: true }
+      }),
+      prisma.policy.findMany({
+        where: { organizationId, status: { not: 'Archived' } }
       }),
       prisma.leaveRequest.count({
         where: { user: { organizationId }, status: 'PENDING' }
@@ -134,47 +170,155 @@ const getDashboardStats = async (req, res, next) => {
         where: { employee: { user: { organizationId } }, status: 'Unpaid' }
       }),
       prisma.auditLog.findMany({
-        take: 3,
+        take: 8,
         where: { user: { organizationId } },
         orderBy: { createdAt: 'desc' },
-        include: { user: { select: { email: true } } }
+        include: { 
+          user: { 
+            select: { 
+              email: true, 
+              role: true,
+              employeeProfile: { select: { fullName: true } } 
+            } 
+          } 
+        }
+      }),
+      prisma.user.findMany({
+        where: { organizationId, role: { notIn: ['SUPERADMIN', 'CANDIDATE'] } },
+        select: {
+          id: true,
+          status: true,
+          createdAt: true,
+          employeeProfile: { 
+            select: { 
+              joiningDate: true,
+              compensationProfile: { select: { baseSalary: true, monthlyCTC: true } }
+            } 
+          }
+        }
       })
     ]);
 
-    const presentCount = attendanceLogs.filter(a => a.status === 'Present').length;
+    // Target Payroll Calculation
+    let targetPayroll = 0;
+    activeCompProfiles.forEach(emp => {
+      const comp = emp.compensationProfile;
+      if (comp?.monthlyCTC && comp.monthlyCTC > 0) {
+        targetPayroll += Number(comp.monthlyCTC);
+      } else if (comp?.baseSalary && comp.baseSalary > 0) {
+        targetPayroll += Number(comp.baseSalary);
+      }
+    });
+
+    // Compliance Alerts (Expiring / Overdue / Renewing Policies)
+    const expiringPoliciesCount = policies.filter(p => {
+      if (p.status === 'Archived' || p.status === 'Resolved') return false;
+      const statusStr = String(p.status || '').toLowerCase().replace(/_/g, ' ');
+      if (statusStr === 'renewing' || statusStr === 'expiring soon') return true;
+      if (!p.expiryDate) return false;
+      const exp = new Date(p.expiryDate);
+      return !isNaN(exp.getTime()) && exp <= thirtyDaysFromNow;
+    }).length;
+
+    // Attendance Calculations
+    const presentCount = attendanceLogs.filter(a => a.status === 'Present' || a.punchIn).length;
     const lateCount = attendanceLogs.filter(a => a.status === 'Late' || a.lateMinutes > 0).length;
     const leaveCount = leavesToday.length;
+    const absentCount = Math.max(0, activeEmployees - presentCount - leaveCount);
 
-    const totalForAttendance = Math.max(totalEmployees, 1);
+    const totalForAttendance = Math.max(activeEmployees, 1);
     const presentPct = Math.round((presentCount / totalForAttendance) * 100);
     const leavePct = Math.round((leaveCount / totalForAttendance) * 100);
-    const latePct = Math.round((lateCount / totalForAttendance) * 100);
+    const lateAbsentPct = Math.round(((lateCount + absentCount) / totalForAttendance) * 100);
 
     const attendanceSummary = {
       present: `${presentPct}%`,
       onLeave: `${leavePct}%`,
-      lateAbsent: `${latePct}%`,
+      lateAbsent: `${lateAbsentPct}%`,
+      presentCount,
+      onLeaveCount: leaveCount,
+      lateAbsentCount: lateCount + absentCount
     };
 
+    // Growth Trend Analytics
+    const now = new Date();
+    const computeGrowth = (numMonths, customYear = null) => {
+      const result = [];
+      for (let i = numMonths - 1; i >= 0; i--) {
+        const d = customYear
+          ? new Date(customYear, 11 - i, 1)
+          : new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const label = d.toLocaleString('en-US', { month: 'short' });
+        const year = d.getFullYear();
+        const endOfMonth = new Date(year, d.getMonth() + 1, 0, 23, 59, 59);
+
+        const count = allOrgUsers.filter(u => {
+          const joinRaw = u.employeeProfile?.joiningDate || u.createdAt;
+          if (!joinRaw) return true;
+          const joinDate = new Date(joinRaw);
+          return !isNaN(joinDate.getTime()) ? joinDate <= endOfMonth : true;
+        }).length;
+
+        result.push({ label, year, count });
+      }
+      const maxCount = Math.max(...result.map(m => m.count), 1);
+      return result.map(m => ({
+        ...m,
+        pct: Math.max(12, Math.round((m.count / maxCount) * 100))
+      }));
+    };
+
+    const growthTrend = {
+      '6months': computeGrowth(6),
+      '12months': computeGrowth(12),
+      'year2026': computeGrowth(12, 2026)
+    };
+
+    // Format Recent Activity Stream
     const formattedActivities = recentActivities.map(log => ({
+      id: log.id,
       text: log.action,
-      details: log.details,
+      action: log.action,
+      details: log.details || '',
+      module: log.module || log.action?.split('_')[0] || 'SYSTEM',
+      level: log.level || 'Info',
       time: log.createdAt,
-      user: log.user?.email || 'System'
+      user: log.user?.employeeProfile?.fullName || log.user?.email || 'System'
     }));
 
-    const organizationScore = Math.max(0, 100 - (pendingLeaves * 2) - (openTickets * 3) - unpaidPayslips);
+    // Dynamic Organization Health Score
+    // Starts at 100 and applies proportional penalties
+    const totalPolicies = Math.max(policies.length, 1);
+    const policyComplianceRatio = Math.max(0, (policies.length - expiringPoliciesCount) / totalPolicies);
+    const attendanceRatio = activeEmployees > 0 ? (presentCount / activeEmployees) : 1;
+
+    let baseScore = 100;
+    baseScore -= (pendingLeaves * 2);
+    baseScore -= (openTickets * 3);
+    baseScore -= (unpaidPayslips * 2);
+    baseScore -= (expiringPoliciesCount * 4);
+
+    // Factor in attendance and compliance ratio
+    const organizationScore = Math.max(
+      15, 
+      Math.min(100, Math.round(baseScore * 0.7 + (policyComplianceRatio * 15) + (attendanceRatio * 15)))
+    );
 
     return res.status(200).json({
       success: true,
       data: {
         totalEmployees,
+        activeEmployees,
         totalDepartments,
+        customRoles,
+        targetPayroll,
+        complianceAlerts: expiringPoliciesCount,
         pendingLeaves,
         openTickets,
         todayAttendance: presentCount,
         unpaidPayslips,
         attendanceSummary,
+        growthTrend,
         recentActivities: formattedActivities,
         organizationScore
       },
@@ -256,6 +400,7 @@ const updateOrganization = async (req, res, next) => {
 // PATCH or POST /api/admin/organization/logo
 const updateOrganizationLogo = async (req, res, next) => {
   try {
+    let logoUrl = null;
     const uploadedFile = req.file || (Array.isArray(req.files) ? req.files[0] : (req.files?.logo?.[0] || req.files?.file?.[0]));
 
     if (uploadedFile) {
@@ -272,13 +417,13 @@ const updateOrganizationLogo = async (req, res, next) => {
 
     const orgId = req.user?.organizationId || req.tenant?.id || req.body?.organizationId;
     let org = orgId ? await prisma.organization.findUnique({ where: { id: orgId } }) : null;
-    if (!org) {
+    if (!org && !orgId) {
       org = await prisma.organization.findFirst();
     }
 
     if (!org) {
       org = await prisma.organization.create({
-        data: { name: req.body?.name || 'GlobalTech Solutions', logoUrl }
+        data: { name: req.body?.name || req.user?.companyName || 'My Organization', logoUrl }
       });
     } else {
       org = await prisma.organization.update({
@@ -388,6 +533,7 @@ const getDepartments = async (req, res, next) => {
         where: { organizationId },
         include: {
           _count: { select: { employees: true, subDepartments: true } },
+          parentDept: { select: { id: true, name: true } },
         },
         orderBy: { name: 'asc' },
       }),
@@ -408,7 +554,8 @@ const getDepartments = async (req, res, next) => {
       const isValidHead = d.head && d.head !== 'None' && validNames.has(d.head);
       return {
         ...d,
-        head: isValidHead ? d.head : 'None'
+        head: isValidHead ? d.head : (d.head || 'None'),
+        parent: d.parent || d.parentDept?.name || 'Corporate',
       };
     });
 
@@ -462,13 +609,29 @@ const createDepartment = async (req, res, next) => {
       });
     }
 
+    // Check for duplicate department code within this organization if provided
+    if (parsed.data.code) {
+      const existingCode = await prisma.department.findFirst({
+        where: {
+          organizationId,
+          code: parsed.data.code,
+        },
+      });
+      if (existingCode) {
+        return res.status(409).json({
+          success: false,
+          error: { code: 'CODE_TAKEN', message: 'A department with this code already exists in your organization.' },
+        });
+      }
+    }
+
     // Resolve parentId and sync legacy parent string
     let parentId = parsed.data.parentId || null;
     let parentName = parsed.data.parent || 'Corporate';
 
     if (parentId) {
-      const parentDept = await prisma.department.findUnique({
-        where: { id: parentId },
+      const parentDept = await prisma.department.findFirst({
+        where: { id: parentId, organizationId },
         select: { name: true },
       });
       if (!parentDept) {
@@ -492,7 +655,10 @@ const createDepartment = async (req, res, next) => {
         color: parsed.data.color || '#4f46e5',
         status: parsed.data.status || 'Active',
       },
-      include: { _count: { select: { employees: true, subDepartments: true } } },
+      include: {
+        _count: { select: { employees: true, subDepartments: true } },
+        parentDept: { select: { id: true, name: true } },
+      },
     });
     return res.status(201).json({ success: true, data: dept, message: 'Department created.' });
   } catch (err) {
@@ -504,6 +670,7 @@ const createDepartment = async (req, res, next) => {
 // PUT /api/admin/departments/:id
 const updateDepartment = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const parsed = departmentSchema.partial().safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
@@ -515,6 +682,23 @@ const updateDepartment = async (req, res, next) => {
     const data = Object.fromEntries(
       Object.entries(parsed.data).filter(([, value]) => value !== undefined)
     );
+
+    // Check duplicate code if code changed
+    if (data.code && organizationId) {
+      const existingCode = await prisma.department.findFirst({
+        where: {
+          organizationId,
+          code: data.code,
+          id: { not: req.params.id },
+        },
+      });
+      if (existingCode) {
+        return res.status(409).json({
+          success: false,
+          error: { code: 'CODE_TAKEN', message: 'A department with this code already exists in your organization.' },
+        });
+      }
+    }
 
     // If parentId is being changed, validate no circular hierarchy
     if ('parentId' in data) {
@@ -528,8 +712,8 @@ const updateDepartment = async (req, res, next) => {
 
       // Sync legacy parent string
       if (data.parentId) {
-        const parentDept = await prisma.department.findUnique({
-          where: { id: data.parentId },
+        const parentDept = await prisma.department.findFirst({
+          where: { id: data.parentId, ...(organizationId ? { organizationId } : {}) },
           select: { name: true },
         });
         if (parentDept) {
@@ -543,7 +727,10 @@ const updateDepartment = async (req, res, next) => {
     const dept = await prisma.department.update({
       where: { id: req.params.id },
       data,
-      include: { _count: { select: { employees: true, subDepartments: true } } },
+      include: {
+        _count: { select: { employees: true, subDepartments: true } },
+        parentDept: { select: { id: true, name: true } },
+      },
     });
     return res.status(200).json({ success: true, data: dept, message: 'Department updated.' });
   } catch (err) { next(err); }
@@ -552,6 +739,9 @@ const updateDepartment = async (req, res, next) => {
 // DELETE /api/admin/departments/:id
 const deleteDepartment = async (req, res, next) => {
   try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const whereClause = { id: req.params.id, ...(organizationId ? { organizationId } : {}) };
+
     // Check for child departments
     const childCount = await prisma.department.count({ where: { parentId: req.params.id } });
     if (childCount > 0) {
@@ -576,7 +766,7 @@ const deleteDepartment = async (req, res, next) => {
       });
     }
 
-    await prisma.department.delete({ where: { id: req.params.id } });
+    await prisma.department.delete({ where: whereClause });
     return res.status(200).json({ success: true, message: 'Department deleted.' });
   } catch (err) { next(err); }
 };
@@ -1520,30 +1710,95 @@ const markPayslipPaid = async (req, res, next) => {
 const getAuditLogs = async (req, res, next) => {
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 15));
     const skip = (page - 1) * limit;
 
-    const { search, action, userId, startDate, endDate } = req.query;
+    const { search, module, level, environment, action, userId, startDate, endDate } = req.query;
 
     const where = {};
-
     const organizationId = req.user.organizationId;
 
+    // Tenant Security: Must belong to this org.
+    // If a user is deleted, userId becomes null, so we must rely on organizationId column if present,
+    // OR fallback to checking user's org if the legacy log didn't store organizationId.
     if (organizationId) {
-      where.user = { organizationId };
-    }
-
-    if (search) {
       where.OR = [
-        { action: { contains: search, mode: 'insensitive' } },
-        { details: { contains: search, mode: 'insensitive' } },
-        { ipAddress: { contains: search, mode: 'insensitive' } },
-        { user: { email: { contains: search, mode: 'insensitive' } } }
+        { organizationId: organizationId },
+        { user: { organizationId: organizationId } }
       ];
     }
 
+    if (search) {
+      where.AND = where.AND || [];
+      where.AND.push({
+        OR: [
+          { action: { contains: search, mode: 'insensitive' } },
+          { details: { contains: search, mode: 'insensitive' } },
+          { ipAddress: { contains: search, mode: 'insensitive' } },
+          { user: { email: { contains: search, mode: 'insensitive' } } }
+        ]
+      });
+    }
+
+    // Explicit Action filter
     if (action && action !== 'All') {
       where.action = { contains: action, mode: 'insensitive' };
+    }
+
+    // Module Filter (matches the prefix of the action, e.g., USER_LOGIN -> USER)
+    if (module && module !== 'All') {
+      where.action = { ...where.action, startsWith: module, mode: 'insensitive' };
+    }
+
+    // Level Filter (derived from action keywords)
+    if (level && level !== 'All') {
+      const lvl = level.toLowerCase();
+      if (lvl === 'critical') {
+        where.action = { ...where.action, contains: 'delete', mode: 'insensitive' };
+      } else if (lvl === 'security') {
+        where.AND = where.AND || [];
+        where.AND.push({
+          OR: [
+            { action: { contains: 'auth', mode: 'insensitive' } },
+            { action: { contains: 'login', mode: 'insensitive' } },
+            { action: { contains: 'role', mode: 'insensitive' } },
+            { action: { contains: 'security', mode: 'insensitive' } }
+          ]
+        });
+      } else if (lvl === 'warning') {
+        where.AND = where.AND || [];
+        where.AND.push({
+          OR: [
+            { action: { contains: 'update', mode: 'insensitive' } },
+            { action: { contains: 'edit', mode: 'insensitive' } },
+            { action: { contains: 'override', mode: 'insensitive' } }
+          ]
+        });
+      } else if (lvl === 'info') {
+        // Exclude critical/security/warning keywords
+        where.AND = where.AND || [];
+        where.AND.push({
+          NOT: {
+            OR: [
+              { action: { contains: 'delete', mode: 'insensitive' } },
+              { action: { contains: 'auth', mode: 'insensitive' } },
+              { action: { contains: 'login', mode: 'insensitive' } },
+              { action: { contains: 'role', mode: 'insensitive' } },
+              { action: { contains: 'update', mode: 'insensitive' } },
+              { action: { contains: 'override', mode: 'insensitive' } }
+            ]
+          }
+        });
+      }
+    }
+
+    // Environment Filter based on IP (heuristic)
+    if (environment && environment !== 'All') {
+      if (environment.toLowerCase() === 'production') {
+        where.NOT = { ipAddress: { in: ['127.0.0.1', '::1', 'localhost'] } };
+      } else if (environment.toLowerCase() === 'staging' || environment.toLowerCase() === 'development') {
+        where.ipAddress = { in: ['127.0.0.1', '::1', 'localhost'] };
+      }
     }
 
     if (userId) {
@@ -1565,7 +1820,7 @@ const getAuditLogs = async (req, res, next) => {
               id: true,
               email: true,
               role: true,
-              employeeProfile: { select: { fullName: true } }
+              employeeProfile: { select: { fullName: true, avatarUrl: true } }
             }
           }
         },
@@ -1576,9 +1831,24 @@ const getAuditLogs = async (req, res, next) => {
       prisma.auditLog.count({ where })
     ]);
 
+    // Map logs to include derived fields directly in the backend response
+    const mappedLogs = logs.map(log => {
+      const act = log.action?.toLowerCase() || '';
+      let derivedLevel = 'Info';
+      if (act.includes('delete') || act.includes('reject') || act.includes('remove')) derivedLevel = 'Critical';
+      else if (act.includes('security') || act.includes('auth') || act.includes('role') || act.includes('login') || act.includes('logout')) derivedLevel = 'Security';
+      else if (act.includes('update') || act.includes('edit') || act.includes('override') || act.includes('modify')) derivedLevel = 'Warning';
+
+      return {
+        ...log,
+        level: derivedLevel,
+        module: log.action?.split('_')[0] || 'SYSTEM',
+      };
+    });
+
     return res.status(200).json({
       success: true,
-      data: logs,
+      data: mappedLogs,
       pagination: {
         page,
         limit,
@@ -1807,6 +2077,23 @@ const sendPolicyReminder = async (req, res, next) => {
     }
 
     return res.status(200).json({ success: true, message: `Reminder sent to ${sentCount} employees.` });
+  } catch (err) { next(err); }
+};
+
+// PATCH /api/admin/policies/:id/resolve
+const resolvePolicy = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const policy = await prisma.policy.findUnique({ where: { id } });
+    if (!policy) {
+      return res.status(404).json({ success: false, error: { message: 'Policy not found.' } });
+    }
+    const newStatus = policy.status === 'Resolved' ? 'Active' : 'Resolved';
+    const updated = await prisma.policy.update({
+      where: { id },
+      data: { status: newStatus },
+    });
+    return res.status(200).json({ success: true, data: updated, message: `Policy status updated to ${newStatus}.` });
   } catch (err) { next(err); }
 };
 
@@ -2380,10 +2667,14 @@ const deleteIntegration = async (req, res, next) => {
 
 const getBillingPlan = async (req, res, next) => {
   try {
-    let plan = await prisma.billingPlan.findFirst();
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    let plan = await prisma.billingPlan.findFirst({
+      where: organizationId ? { organizationId } : {}
+    });
     if (!plan) {
       plan = await prisma.billingPlan.create({
         data: {
+          organizationId,
           name: "Professional",
           price: 29,
           cycle: "Monthly",
@@ -2392,41 +2683,57 @@ const getBillingPlan = async (req, res, next) => {
         }
       });
     }
-    return res.status(200).json({ success: true, data: { ...plan, addons: JSON.parse(plan.addons) } });
+    return res.status(200).json({ success: true, data: { ...plan, addons: JSON.parse(plan.addons || "[]") } });
   } catch (err) { next(err); }
 };
 
 const updateBillingPlan = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const organizationId = req.user?.organizationId || req.tenant?.id;
     const { name, price, cycle, users, addons } = req.body;
+    
+    // Ensure plan belongs to organization if provided
+    const existing = await prisma.billingPlan.findUnique({ where: { id } });
+    if (existing && existing.organizationId && organizationId && existing.organizationId !== organizationId) {
+      return res.status(403).json({ success: false, error: { message: "Unauthorized access to billing plan" } });
+    }
+
     const plan = await prisma.billingPlan.update({
       where: { id },
       data: {
-        name,
-        price,
-        cycle,
-        users,
-        addons: addons ? JSON.stringify(addons) : undefined
+        ...(name && { name }),
+        ...(price !== undefined && { price: Number(price) }),
+        ...(cycle && { cycle }),
+        ...(users !== undefined && { users: typeof users === 'number' ? users : parseInt(users) || 42 }),
+        ...(addons && { addons: JSON.stringify(addons) })
       }
     });
-    return res.status(200).json({ success: true, data: { ...plan, addons: JSON.parse(plan.addons) } });
+    return res.status(200).json({ success: true, data: { ...plan, addons: JSON.parse(plan.addons || "[]") } });
   } catch (err) { next(err); }
 };
 
 const getInvoices = async (req, res, next) => {
   try {
-    let invoices = await prisma.invoice.findMany({ orderBy: { date: 'desc' } });
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    let invoices = await prisma.invoice.findMany({
+      where: organizationId ? { organizationId } : {},
+      orderBy: { date: 'desc' }
+    });
+
     if (invoices.length === 0) {
       await prisma.invoice.createMany({
         data: [
-          { amount: '4,280.00', method: 'Visa •••• 4242', status: 'Paid', date: new Date('2026-10-01') },
-          { amount: '4,280.00', method: 'Visa •••• 4242', status: 'Paid', date: new Date('2026-09-01') },
-          { amount: '4,200.00', method: 'Visa •••• 4242', status: 'Paid', date: new Date('2026-08-01') },
-          { amount: '4,200.00', method: 'Visa •••• 4242', status: 'Refunded', date: new Date('2026-07-01') },
+          { organizationId, amount: '$4,280.00', method: 'Visa •••• 4242', status: 'Paid', date: new Date('2026-10-01') },
+          { organizationId, amount: '$4,280.00', method: 'Visa •••• 4242', status: 'Paid', date: new Date('2026-09-01') },
+          { organizationId, amount: '$4,200.00', method: 'Visa •••• 4242', status: 'Paid', date: new Date('2026-08-01') },
+          { organizationId, amount: '$4,200.00', method: 'Visa •••• 4242', status: 'Refunded', date: new Date('2026-07-01') },
         ]
       });
-      invoices = await prisma.invoice.findMany({ orderBy: { date: 'desc' } });
+      invoices = await prisma.invoice.findMany({
+        where: organizationId ? { organizationId } : {},
+        orderBy: { date: 'desc' }
+      });
     }
     return res.status(200).json({ success: true, data: invoices });
   } catch (err) { next(err); }
@@ -2434,7 +2741,13 @@ const getInvoices = async (req, res, next) => {
 
 const createInvoice = async (req, res, next) => {
   try {
-    const invoice = await prisma.invoice.create({ data: req.body });
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const invoice = await prisma.invoice.create({
+      data: {
+        ...req.body,
+        organizationId
+      }
+    });
     return res.status(201).json({ success: true, data: invoice });
   } catch (err) { next(err); }
 };
@@ -2442,6 +2755,15 @@ const createInvoice = async (req, res, next) => {
 const updateInvoice = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const existing = await prisma.invoice.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ success: false, error: { message: "Invoice not found" } });
+    }
+    if (existing.organizationId && organizationId && existing.organizationId !== organizationId) {
+      return res.status(403).json({ success: false, error: { message: "Unauthorized invoice access" } });
+    }
+
     const invoice = await prisma.invoice.update({
       where: { id },
       data: req.body
@@ -2453,6 +2775,15 @@ const updateInvoice = async (req, res, next) => {
 const deleteInvoice = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const existing = await prisma.invoice.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ success: false, error: { message: "Invoice not found" } });
+    }
+    if (existing.organizationId && organizationId && existing.organizationId !== organizationId) {
+      return res.status(403).json({ success: false, error: { message: "Unauthorized invoice access" } });
+    }
+
     await prisma.invoice.delete({ where: { id } });
     return res.status(200).json({ success: true, message: 'Invoice deleted.' });
   } catch (err) { next(err); }
@@ -2460,7 +2791,11 @@ const deleteInvoice = async (req, res, next) => {
 
 const exportInvoices = async (req, res, next) => {
   try {
-    const invoices = await prisma.invoice.findMany({ orderBy: { date: 'desc' } });
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const invoices = await prisma.invoice.findMany({
+      where: organizationId ? { organizationId } : {},
+      orderBy: { date: 'desc' }
+    });
 
     // CSV Header
     let csv = 'ID,Date,Amount,Method,Status\n';
@@ -2482,13 +2817,109 @@ const exportInvoices = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+const getPaymentMethod = async (req, res, next) => {
+  try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    let pm = await prisma.organizationPaymentMethod.findFirst({
+      where: organizationId ? { organizationId } : {}
+    });
+
+    if (!pm && organizationId) {
+      pm = await prisma.organizationPaymentMethod.create({
+        data: {
+          organizationId,
+          type: 'Visa',
+          last4: '4242',
+          expiry: '12/28',
+          cardholder: 'Enterprise Client',
+          isDefault: true
+        }
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: pm || {
+        type: 'Visa',
+        last4: '4242',
+        expiry: '12/28',
+        cardholder: 'Enterprise Client'
+      }
+    });
+  } catch (err) { next(err); }
+};
+
+const savePaymentMethod = async (req, res, next) => {
+  try {
+    const organizationId = req.user?.organizationId || req.tenant?.id;
+    const { type, last4, expiry, cardholder } = req.body;
+
+    if (!organizationId) {
+      return res.status(400).json({ success: false, error: { message: "Organization context required" } });
+    }
+
+    let pm = await prisma.organizationPaymentMethod.findFirst({
+      where: { organizationId }
+    });
+
+    if (pm) {
+      pm = await prisma.organizationPaymentMethod.update({
+        where: { id: pm.id },
+        data: { type, last4, expiry, cardholder }
+      });
+    } else {
+      pm = await prisma.organizationPaymentMethod.create({
+        data: {
+          organizationId,
+          type: type || 'Visa',
+          last4: last4 || '4242',
+          expiry: expiry || '12/28',
+          cardholder: cardholder || 'Enterprise Client',
+          isDefault: true
+        }
+      });
+    }
+
+    return res.status(200).json({ success: true, data: pm, message: 'Payment method updated successfully.' });
+  } catch (err) { next(err); }
+};
+
 // ATTENDANCE & LEAVES
 const getAllAttendance = async (req, res, next) => {
   try {
     const organizationId = req.user?.organizationId || req.tenant?.id;
+    const { date, departmentId } = req.query;
+
+    const where = {};
+    if (organizationId) {
+      where.user = { organizationId };
+    }
+    if (date) {
+      const targetDate = new Date(date);
+      const startOfDay = new Date(new Date(targetDate).setHours(0, 0, 0, 0));
+      const endOfDay = new Date(new Date(targetDate).setHours(23, 59, 59, 999));
+      where.date = { gte: startOfDay, lte: endOfDay };
+    }
+    if (departmentId) {
+      where.user = {
+        ...where.user,
+        employeeProfile: { departmentId }
+      };
+    }
+
     const logs = await prisma.attendanceLog.findMany({
-      where: organizationId ? { user: { organizationId } } : {},
-      include: { user: { include: { employeeProfile: true } } },
+      where,
+      include: {
+        user: {
+          include: {
+            employeeProfile: {
+              include: {
+                department: true,
+              }
+            }
+          }
+        }
+      },
       orderBy: { date: 'desc' }
     });
     return res.status(200).json({ success: true, data: logs });
@@ -2502,7 +2933,36 @@ const addManualAttendance = async (req, res, next) => {
     let finalWorkedMin = totalWorkedMin || 0;
     let breakMinutes = 0;
 
+    const logDate = new Date(date);
+    const dateOnlyStr = typeof date === 'string' ? date.split('T')[0] : logDate.toISOString().split('T')[0];
+    const startOfDay = new Date(`${dateOnlyStr}T00:00:00.000Z`);
+    const endOfDay = new Date(`${dateOnlyStr}T23:59:59.999Z`);
+
+    let parsedClockIn = null;
+    if (clockIn) {
+      if (clockIn.includes('T')) {
+        parsedClockIn = new Date(clockIn);
+      } else {
+        parsedClockIn = new Date(`${dateOnlyStr}T${clockIn.length === 5 ? clockIn + ':00' : clockIn}Z`);
+      }
+    } else {
+      parsedClockIn = new Date(`${dateOnlyStr}T09:00:00.000Z`);
+    }
+
+    let parsedClockOut = null;
     if (clockOut) {
+      if (clockOut.includes('T')) {
+        parsedClockOut = new Date(clockOut);
+      } else {
+        parsedClockOut = new Date(`${dateOnlyStr}T${clockOut.length === 5 ? clockOut + ':00' : clockOut}Z`);
+      }
+    }
+
+    if (parsedClockOut && parsedClockIn && !finalWorkedMin) {
+      finalWorkedMin = Math.max(0, Math.floor((parsedClockOut.getTime() - parsedClockIn.getTime()) / 60000));
+    }
+
+    if (parsedClockOut) {
       const employee = await prisma.employeeProfile.findUnique({ 
         where: { userId }, 
         select: { shiftId: true } 
@@ -2523,20 +2983,90 @@ const addManualAttendance = async (req, res, next) => {
       }
     }
 
-    const log = await prisma.attendanceLog.create({
-      data: {
+    // Upsert if a record already exists for this user on this day
+    const existing = await prisma.attendanceLog.findFirst({
+      where: {
         userId,
-        date: new Date(date),
-        clockIn: new Date(clockIn),
-        clockOut: clockOut ? new Date(clockOut) : null,
-        status: status || 'Present',
-        mode: mode || 'Office',
-        totalWorkedMin: finalWorkedMin,
-        breakMinutes
-      },
-      include: { user: { include: { employeeProfile: true } } }
+        date: { gte: startOfDay, lte: endOfDay }
+      }
     });
-    return res.status(201).json({ success: true, data: log });
+
+    let log;
+    if (existing) {
+      log = await prisma.attendanceLog.update({
+        where: { id: existing.id },
+        data: {
+          clockIn: parsedClockIn,
+          clockOut: parsedClockOut,
+          status: status || 'Present',
+          mode: mode || 'Office',
+          totalWorkedMin: finalWorkedMin,
+          breakMinutes
+        },
+        include: { user: { include: { employeeProfile: { include: { department: true } } } } }
+      });
+    } else {
+      log = await prisma.attendanceLog.create({
+        data: {
+          userId,
+          date: logDate,
+          clockIn: parsedClockIn,
+          clockOut: parsedClockOut,
+          status: status || 'Present',
+          mode: mode || 'Office',
+          totalWorkedMin: finalWorkedMin,
+          breakMinutes
+        },
+        include: { user: { include: { employeeProfile: { include: { department: true } } } } }
+      });
+    }
+
+    return res.status(201).json({ success: true, data: log, message: 'Attendance record saved.' });
+  } catch (err) { next(err); }
+};
+
+const updateAttendance = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status, clockIn, clockOut, totalWorkedMin, mode } = req.body;
+
+    const existing = await prisma.attendanceLog.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ success: false, error: { message: 'Attendance record not found' } });
+    }
+
+    const data = {};
+    if (status !== undefined) data.status = status;
+    if (mode !== undefined) data.mode = mode;
+    if (clockIn !== undefined) data.clockIn = clockIn ? new Date(clockIn) : null;
+    if (clockOut !== undefined) data.clockOut = clockOut ? new Date(clockOut) : null;
+    if (totalWorkedMin !== undefined) data.totalWorkedMin = totalWorkedMin;
+
+    const updated = await prisma.attendanceLog.update({
+      where: { id },
+      data,
+      include: {
+        user: {
+          include: {
+            employeeProfile: {
+              include: {
+                department: true,
+              }
+            }
+          }
+        }
+      }
+    });
+
+    return res.status(200).json({ success: true, data: updated, message: 'Attendance updated.' });
+  } catch (err) { next(err); }
+};
+
+const deleteAttendance = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    await prisma.attendanceLog.delete({ where: { id } });
+    return res.status(200).json({ success: true, message: 'Attendance record deleted.' });
   } catch (err) { next(err); }
 };
 
@@ -2611,17 +3141,25 @@ const reviewLeave = async (req, res, next) => {
 };
 
 // GET /api/admin/resignations
+// GET /api/admin/resignations
 const getAdminResignations = async (req, res, next) => {
   try {
     const organizationId = req.user?.organizationId || req.tenant?.id;
     const resignations = await prisma.exitLifecycle.findMany({
       where: {
         exitType: 'RESIGNATION',
-        ...(organizationId ? { employee: { user: { organizationId } } } : {})
+        ...(organizationId ? { employee: { OR: [{ organizationId }, { user: { organizationId } }] } } : {})
       },
       include: {
         employee: {
-          select: { id: true, employeeId: true, fullName: true, department: true }
+          select: {
+            id: true,
+            employeeId: true,
+            fullName: true,
+            avatarUrl: true,
+            department: { select: { id: true, name: true } },
+            user: { select: { id: true, email: true } }
+          }
         }
       },
       orderBy: { createdAt: 'desc' }
@@ -2635,21 +3173,100 @@ const overrideResignation = async (req, res, next) => {
   try {
     const { status, adminComment } = req.body;
     const exitId = req.params.id;
+    const organizationId = req.user?.organizationId || req.tenant?.id;
 
-    if (!['APPROVED', 'REJECTED_BY_HR', 'REJECTED_BY_MANAGER'].includes(status)) {
+    const validStatuses = [
+      'PENDING_MANAGER_APPROVAL',
+      'PENDING_HR_APPROVAL',
+      'APPROVED',
+      'REJECTED_BY_MANAGER',
+      'REJECTED_BY_HR',
+      'EMPLOYEE_RELIEVED',
+      'INITIATED',
+      'CLEARANCE_IN_PROGRESS',
+      'COMPLETED',
+      'CANCELLED'
+    ];
+
+    if (!status || !validStatuses.includes(status)) {
       return res.status(400).json({ success: false, error: { message: 'Invalid status for admin override.' } });
     }
 
+    const existingExit = await prisma.exitLifecycle.findFirst({
+      where: {
+        id: exitId,
+        exitType: 'RESIGNATION',
+        ...(organizationId ? { employee: { OR: [{ organizationId }, { user: { organizationId } }] } } : {})
+      },
+      include: {
+        employee: {
+          select: { id: true, fullName: true, employeeId: true, userId: true }
+        }
+      }
+    });
+
+    if (!existingExit) {
+      return res.status(404).json({ success: false, error: { message: 'Resignation record not found or access denied.' } });
+    }
+
+    const previousStatus = existingExit.status;
+
+    // Update resignation record
     const updated = await prisma.exitLifecycle.update({
       where: { id: exitId },
       data: {
         status,
-        hrComment: adminComment || 'Admin Override',
+        hrComment: adminComment ? `[ADMIN OVERRIDE] ${adminComment}` : existingExit.hrComment,
         hrDecisionDate: new Date()
+      },
+      include: {
+        employee: {
+          select: {
+            id: true,
+            employeeId: true,
+            fullName: true,
+            avatarUrl: true,
+            department: { select: { id: true, name: true } },
+            user: { select: { id: true, email: true } }
+          }
+        }
       }
     });
 
-    return res.status(200).json({ success: true, data: updated, message: 'Resignation overridden by Admin.' });
+    // Synchronize employee lifecycle status based on new resignation status
+    if (existingExit.employeeId) {
+      let targetLifecycleStatus = null;
+      if (['APPROVED', 'CLEARANCE_IN_PROGRESS', 'PENDING_HR_APPROVAL'].includes(status)) {
+        targetLifecycleStatus = 'ON_NOTICE';
+      } else if (['EMPLOYEE_RELIEVED', 'COMPLETED'].includes(status)) {
+        targetLifecycleStatus = 'RESIGNED';
+      } else if (['REJECTED_BY_MANAGER', 'REJECTED_BY_HR', 'CANCELLED'].includes(status)) {
+        targetLifecycleStatus = 'ACTIVE';
+      }
+
+      if (targetLifecycleStatus) {
+        await prisma.employeeProfile.update({
+          where: { id: existingExit.employeeId },
+          data: { lifecycleStatus: targetLifecycleStatus }
+        });
+      }
+    }
+
+    // Create Audit Log
+    const currentUserId = req.user?.id || req.user?.userId;
+    if (currentUserId) {
+      await prisma.auditLog.create({
+        data: {
+          userId: currentUserId,
+          organizationId: organizationId || null,
+          action: 'RESIGNATION_OVERRIDDEN',
+          details: `Admin overridden resignation status for ${existingExit.employee?.fullName || 'Employee'} (${existingExit.employee?.employeeId || exitId}) from ${previousStatus} to ${status}.${adminComment ? ` Reason: ${adminComment}` : ''}`,
+          ipAddress: req.ip || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null
+        }
+      });
+    }
+
+    return res.status(200).json({ success: true, data: updated, message: 'Resignation overridden successfully.' });
   } catch (err) { next(err); }
 };
 
@@ -2665,12 +3282,14 @@ module.exports = {
   toggleArchivePolicy,
   renewPolicy,
   sendPolicyReminder,
+  resolvePolicy,
   getRoles, createRole, updateRole, deleteRole, getRoleHistory,
   getHolidays, createHoliday, updateHoliday, deleteHoliday,
   getBenefitPlans, createBenefitPlan, updateBenefitPlan, deleteBenefitPlan,
   getAiModules, updateAiModule, getAiLogs, createAiLog,
   getIntegrations, createIntegration, updateIntegration, deleteIntegration,
   getBillingPlan, updateBillingPlan, getInvoices, createInvoice, updateInvoice, deleteInvoice, exportInvoices,
-  getAllAttendance, addManualAttendance, getAllLeaves, reviewLeave,
+  getPaymentMethod, savePaymentMethod,
+  getAllAttendance, addManualAttendance, updateAttendance, deleteAttendance, getAllLeaves, reviewLeave,
   getAdminResignations, overrideResignation
 };
