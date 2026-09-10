@@ -79,7 +79,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
 
 // Rate limiting – apply after CORS so blocked requests still get CORS headers
 const rateLimiter = require('./src/middlewares/rateLimiter');
