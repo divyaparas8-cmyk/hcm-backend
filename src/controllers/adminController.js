@@ -2320,8 +2320,10 @@ const createHoliday = async (req, res, next) => {
     let holidayType = 'PUBLIC';
     if (type) {
       const upper = type.toUpperCase();
-      if (['PUBLIC', 'OPTIONAL', 'RESTRICTED', 'COMPANY'].includes(upper)) {
+      if (['PUBLIC', 'OPTIONAL', 'COMPANY', 'REGIONAL'].includes(upper)) {
         holidayType = upper;
+      } else if (upper === 'RESTRICTED') {
+        holidayType = 'OPTIONAL';
       }
     }
     const holiday = await prisma.holiday.create({
@@ -2349,8 +2351,10 @@ const updateHoliday = async (req, res, next) => {
     if (date !== undefined) updateData.date = String(date);
     if (type !== undefined) {
       const upper = type.toUpperCase();
-      if (['PUBLIC', 'OPTIONAL', 'RESTRICTED', 'COMPANY'].includes(upper)) {
+      if (['PUBLIC', 'OPTIONAL', 'COMPANY', 'REGIONAL'].includes(upper)) {
         updateData.type = upper;
+      } else if (upper === 'RESTRICTED') {
+        updateData.type = 'OPTIONAL';
       }
     }
     if (region !== undefined) updateData.region = region;

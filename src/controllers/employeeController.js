@@ -1505,9 +1505,10 @@ const submitBenefitClaim = async (req, res, next) => {
   try {
     const profile = await getOrCreateProfile(req.user.userId);
 
-    const { type, amount, date, description, receiptUrl, receiptBase64, receiptName, file } = req.body;
-    if (!type || !amount) {
-      return res.status(400).json({ success: false, error: { message: 'Type and amount are required' } });
+    const { type, amount, date, description, category, receiptUrl, receiptBase64, receiptName, file } = req.body;
+    const claimTitle = req.body.title || type;
+    if (!claimTitle || !amount) {
+      return res.status(400).json({ success: false, error: { message: 'Claim title and amount are required' } });
     }
 
     let finalReceiptUrl = receiptUrl || null;
@@ -1531,11 +1532,20 @@ const submitBenefitClaim = async (req, res, next) => {
       }
     ];
 
+    const catLabel = category || '';
+    const descText = description || '';
+    let providerText = descText;
+    if (catLabel && descText && !descText.toLowerCase().includes(catLabel.toLowerCase())) {
+      providerText = `[${catLabel}] ${descText}`;
+    } else if (catLabel && !descText) {
+      providerText = catLabel;
+    }
+
     const claim = await prisma.benefitClaim.create({
       data: {
         employeeId: profile.id,
-        title: type,
-        provider: finalReceiptUrl ? `${description || 'General'} [Receipt: ${finalReceiptUrl}]` : (description || 'General'),
+        title: claimTitle,
+        provider: finalReceiptUrl ? `${providerText || 'General'} [Receipt: ${finalReceiptUrl}]` : (providerText || 'General'),
         amount: parseFloat(amount) || 0,
         status: 'Pending', // Legacy status field kept for compatibility
         managerStatus,

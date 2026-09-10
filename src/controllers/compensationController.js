@@ -468,7 +468,16 @@ exports.getEmployeePayroll = async (req, res) => {
     // Resolve employeeProfileId
     const emp = await prisma.employeeProfile.findUnique({
       where: { userId: req.user.userId },
-      include: { user: { select: { organizationId: true } } }
+      include: { 
+        user: { 
+          select: { 
+            organizationId: true,
+            customRole: { select: { name: true } },
+            organization: { select: { name: true } }
+          } 
+        },
+        department: { select: { name: true } }
+      }
     });
     if (!emp) return res.status(404).json({ success: false, error: { message: 'Employee profile not found.' } });
 
@@ -504,7 +513,8 @@ exports.getEmployeePayroll = async (req, res) => {
       items: s.items,
       employeeName: emp.fullName,
       employeeCode: emp.employeeId,
-      designation: emp.designation,
+      designation: emp.user?.customRole?.name || emp.department?.name || 'Staff Software Architect',
+      companyName: emp.user?.organization?.name || 'GlobalTech Solutions'
     }));
 
     // Resolve salary structure name
