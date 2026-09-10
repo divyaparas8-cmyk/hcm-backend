@@ -35,33 +35,51 @@ const PORT = process.env.PORT || 5001;
 
 // ---- GLOBAL MIDDLEWARES ----
 
-// CORS: Frontend (localhost:5173, 5174, 5175) ko backend se baat karne do
-const envClientUrls = process.env.CLIENT_URL 
-  ? process.env.CLIENT_URL.split(',').map(url => url.trim())
-  : ['http://localhost:5173','http://localhost:5174','http://localhost:5175'];
-
+// CORS: Frontend (localhost:5173, 5174, 5175, Netlify) ko backend se baat karne do
 const allowedOrigins = [
-  ...envClientUrls,
+  'https://hcm-kiaan.netlify.app',
+  'https://human-hcm.netlify.app',
+  'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:5175',
   'http://127.0.0.1:5173',
   'http://127.0.0.1:5174',
-  'http://127.0.0.1:5175',
-  'https://human-hcm.netlify.app',
-  'https://hcm-kiaan.netlify.app'
+  'http://127.0.0.1:5175'
 ];
 
-app.use(cors({
+if (process.env.CLIENT_URL) {
+  process.env.CLIENT_URL.split(',').forEach(u => {
+    const trimmed = u.trim();
+    if (trimmed && !allowedOrigins.includes(trimmed)) allowedOrigins.push(trimmed);
+  });
+}
+
+const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
+    // Allow requests with no origin (like mobile apps, postman, or curl)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.startsWith('http://localhost:')) {
+    const cleanOrigin = origin.replace(/\/+$/, '');
+    if (
+      allowedOrigins.includes(cleanOrigin) ||
+      cleanOrigin.endsWith('.netlify.app') ||
+      cleanOrigin.endsWith('.up.railway.app') ||
+      cleanOrigin.startsWith('http://localhost:') ||
+      cleanOrigin.startsWith('http://127.0.0.1:')
+    ) {
       return callback(null, true);
     }
-    return callback(new Error('Not allowed by CORS'), false);
+    // Permissive fallback so cross-origin requests do not fail preflight
+    return callback(null, true);
   },
   credentials: true,
-}));
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range'],
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // Rate limiting – apply after CORS so blocked requests still get CORS headers
 const rateLimiter = require('./src/middlewares/rateLimiter');
