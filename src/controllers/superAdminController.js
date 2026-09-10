@@ -149,7 +149,101 @@ const getPlatformStats = async (req, res, next) => {
 // ─────────────────────────────────────────
 const getAllOrganizations = async (req, res, next) => {
   try {
-    const orgs = await prisma.organization.findMany({
+    const { search, status, plan, subscriptionStatus, page, limit } = req.query;
+
+    const where = {};
+
+    if (search && search.trim()) {
+      const q = search.trim();
+      where.OR = [
+        { name: { contains: q } },
+        { industry: { contains: q } },
+        { id: { contains: q } },
+        { primaryEmail: { contains: q } },
+      ];
+    }
+
+    if (status && status !== 'ALL') {
+      where.status = status.toUpperCase();
+    }
+
+    if (subscriptionStatus && subscriptionStatus !== 'ALL') {
+      where.subscriptionStatus = subscriptionStatus.toUpperCase();
+    }
+
+    if (plan && plan !== 'ALL') {
+      if (plan.toUpperCase() === 'TRIAL') {
+        where.subscriptionStatus = 'TRIAL';
+      } else {
+        where.pricingPlan = {
+          name: { equals: plan }
+        };
+      }
+    }
+
+    const isPaginated = Boolean(page || limit);
+    const take = limit ? Math.min(100, Math.max(1, parseInt(limit, 10))) : (isPaginated ? 12 : undefined);
+    const skip = page && take ? (Math.max(1, parseInt(page, 10)) - 1) * take : undefined;
+
+    const [orgs, totalCount] = await Promise.all([
+      prisma.organization.findMany({
+        where,
+        include: {
+          pricingPlan: true,
+          _count: {
+            select: {
+              users: true,
+              departments: true,
+              employeeProfiles: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        ...(take ? { take } : {}),
+        ...(skip !== undefined ? { skip } : {}),
+      }),
+      prisma.organization.count({ where }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: orgs,
+      meta: {
+        total: totalCount,
+        page: page ? parseInt(page, 10) : 1,
+        limit: take || totalCount,
+        totalPages: take ? Math.ceil(totalCount / take) : 1,
+      }
+    });
+  } catch (err) { next(err); }
+};
+
+// PUT /api/superadmin/organizations/:id (update organization metadata)
+const updateOrganization = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { name, legalName, industry, companySize, address, primaryEmail, phone, websiteUrl, currency, timezone } = req.body;
+
+    const existing = await prisma.organization.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Organization not found.' } });
+    }
+
+    const data = {};
+    if (name !== undefined) data.name = name.trim();
+    if (legalName !== undefined) data.legalName = legalName?.trim() || null;
+    if (industry !== undefined) data.industry = industry?.trim() || null;
+    if (companySize !== undefined) data.companySize = companySize?.trim() || null;
+    if (address !== undefined) data.address = address?.trim() || null;
+    if (primaryEmail !== undefined) data.primaryEmail = primaryEmail?.trim() || null;
+    if (phone !== undefined) data.phone = phone?.trim() || null;
+    if (websiteUrl !== undefined) data.websiteUrl = websiteUrl?.trim() || null;
+    if (currency !== undefined) data.currency = currency?.trim() || null;
+    if (timezone !== undefined) data.timezone = timezone?.trim() || null;
+
+    const updated = await prisma.organization.update({
+      where: { id },
+      data,
       include: {
         pricingPlan: true,
         _count: {
@@ -157,13 +251,30 @@ const getAllOrganizations = async (req, res, next) => {
             users: true,
             departments: true,
             employeeProfiles: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
+          }
+        }
+      }
     });
 
-    return res.status(200).json({ success: true, data: orgs, meta: { total: orgs.length } });
+    const userId = req.user?.userId || req.user?.id;
+    if (userId) {
+      try {
+        await prisma.auditLog.create({
+          data: {
+            userId,
+            action: 'UPDATE_ORGANIZATION',
+            details: `Updated metadata for organization "${updated.name}" (${id})`,
+            ipAddress: req.ip || req.socket?.remoteAddress
+          }
+        });
+      } catch (aErr) {}
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: updated,
+      message: 'Organization updated successfully.'
+    });
   } catch (err) { next(err); }
 };
 
@@ -484,10 +595,10 @@ const deleteOrganization = async (req, res, next) => {
       await tx.attendancePolicy.deleteMany({ where: { organizationId: orgId } });
       await tx.policyAcknowledgment.deleteMany({ where: { organizationId: orgId } });
       await tx.policy.deleteMany({ where: { organizationId: orgId } });
-      await tx.workCalendar.deleteMany({ where: { organizationId: orgId } });
+      await tx.holiday.deleteMany({ where: { calendar: { companyId: orgId } } });
+      await tx.workCalendar.deleteMany({ where: { companyId: orgId } });
       await tx.shift.deleteMany({ where: { organizationId: orgId } });
       await tx.overtimePolicy.deleteMany({ where: { organizationId: orgId } });
-      await tx.holiday.deleteMany({ where: { organizationId: orgId } });
       await tx.customRole.deleteMany({ where: { organizationId: orgId } });
       await tx.document.deleteMany({ where: { organizationId: orgId } });
       await tx.notification.deleteMany({ where: { organizationId: orgId } });
@@ -520,26 +631,63 @@ const deleteOrganization = async (req, res, next) => {
 // ─────────────────────────────────────────
 const getAllPlatformUsers = async (req, res, next) => {
   try {
-    const { role, isActive, organizationId } = req.query;
+    const { role, isActive, organizationId, search } = req.query;
+
+    const where = {};
+
+    if (role && role !== 'ALL') {
+      where.role = role;
+    }
+
+    if (isActive !== undefined && isActive !== '') {
+      where.isActive = isActive === 'true';
+    }
+
+    if (organizationId && organizationId !== 'ALL') {
+      if (organizationId === 'none' || organizationId === 'null') {
+        where.organizationId = null;
+      } else {
+        where.organizationId = organizationId;
+      }
+    }
+
+    if (search && search.trim()) {
+      const q = search.trim();
+      where.OR = [
+        { email: { contains: q } },
+        { employeeProfile: { fullName: { contains: q } } },
+        { candidateProfile: { fullName: { contains: q } } },
+        { organization: { name: { contains: q } } },
+      ];
+    }
 
     const users = await prisma.user.findMany({
-      where: {
-        ...(role ? { role } : { role: { not: 'SUPERADMIN' } }),
-        ...(isActive !== undefined && { isActive: isActive === 'true' }),
-        ...(organizationId && { organizationId }),
-      },
+      where,
       select: {
         id: true,
         email: true,
         role: true,
         isActive: true,
         createdAt: true,
-        organization: { select: { name: true } },
+        updatedAt: true,
+        organizationId: true,
+        organization: { 
+          select: { 
+            id: true, 
+            name: true,
+            status: true 
+          } 
+        },
         employeeProfile: {
           select: {
             id: true,
             fullName: true,
             employeeId: true,
+            phone: true,
+            avatarUrl: true,
+            department: {
+              select: { id: true, name: true }
+            },
             compensationProfile: {
               select: {
                 baseSalary: true,
@@ -548,6 +696,19 @@ const getAllPlatformUsers = async (req, res, next) => {
             }
           }
         },
+        candidateProfile: {
+          select: {
+            id: true,
+            fullName: true,
+            phone: true
+          }
+        },
+        customRole: {
+          select: {
+            id: true,
+            name: true
+          }
+        }
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -773,27 +934,159 @@ const resetUserPassword = async (req, res, next) => {
 // ─────────────────────────────────────────
 const getPlatformAuditLogs = async (req, res, next) => {
   try {
-    const { userId, action, take = '100' } = req.query;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const skip = (page - 1) * limit;
 
-    const logs = await prisma.auditLog.findMany({
-      where: {
-        ...(userId && { userId }),
-        ...(action && { action: { contains: action } }),
-      },
-      include: {
-        user: {
-          select: {
-            email: true,
-            role: true,
-            organization: { select: { name: true } },
+    const { userId, organizationId, action, search, startDate, endDate, status } = req.query;
+
+    const where = {};
+
+    if (userId && userId !== 'ALL') {
+      where.userId = userId;
+    }
+
+    if (organizationId && organizationId !== 'ALL') {
+      if (organizationId === 'none' || organizationId === 'null') {
+        where.AND = [
+          ...(where.AND || []),
+          { organizationId: null },
+          { user: { organizationId: null } }
+        ];
+      } else {
+        where.OR = [
+          { organizationId },
+          { user: { organizationId } }
+        ];
+      }
+    }
+
+    if (action && action !== 'ALL') {
+      where.action = action;
+    }
+
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) {
+        where.createdAt.gte = new Date(startDate);
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        if (typeof endDate === 'string' && endDate.length <= 10) {
+          end.setHours(23, 59, 59, 999);
+        }
+        where.createdAt.lte = end;
+      }
+    }
+
+    if (status && status !== 'ALL') {
+      if (status === 'FAILURE') {
+        where.OR = [
+          { details: { contains: 'failed' } },
+          { details: { contains: 'Failed' } },
+          { details: { contains: 'error' } }
+        ];
+      } else if (status === 'SUCCESS') {
+        where.NOT = [
+          { details: { contains: 'failed' } },
+          { details: { contains: 'Failed' } },
+          { details: { contains: 'error' } }
+        ];
+      }
+    }
+
+    if (search && search.trim()) {
+      const q = search.trim();
+      const searchConditions = [
+        { action: { contains: q } },
+        { details: { contains: q } },
+        { ipAddress: { contains: q } },
+        { user: { email: { contains: q } } },
+        { user: { employeeProfile: { fullName: { contains: q } } } },
+        { user: { organization: { name: { contains: q } } } },
+        { Organization: { name: { contains: q } } }
+      ];
+
+      where.AND = [
+        ...(where.AND || []),
+        { OR: searchConditions }
+      ];
+    }
+
+    const [total, logs] = await Promise.all([
+      prisma.auditLog.count({ where }),
+      prisma.auditLog.findMany({
+        where,
+        include: {
+          user: {
+            select: {
+              id: true,
+              email: true,
+              role: true,
+              organization: {
+                select: {
+                  id: true,
+                  name: true
+                }
+              },
+              employeeProfile: {
+                select: {
+                  id: true,
+                  fullName: true
+                }
+              }
+            }
           },
+          Organization: {
+            select: {
+              id: true,
+              name: true
+            }
+          }
         },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: parseInt(take),
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit
+      })
+    ]);
+
+    const totalPages = Math.ceil(total / limit) || 1;
+
+    // Normalize records for client consumption
+    const enrichedLogs = logs.map(log => {
+      const isFailure = log.details && /failed|error/i.test(log.details);
+      const actorName = log.user?.employeeProfile?.fullName || log.user?.email || 'System / Platform';
+      const orgName = log.Organization?.name || log.user?.organization?.name || (log.user?.role === 'SUPERADMIN' ? 'Platform / Global' : 'System');
+      
+      return {
+        id: log.id,
+        createdAt: log.createdAt,
+        userId: log.userId,
+        actorName,
+        actorEmail: log.user?.email || null,
+        actorRole: log.user?.role || 'SYSTEM',
+        organizationName: orgName,
+        organizationId: log.organizationId || log.user?.organization?.id || null,
+        action: log.action,
+        details: log.details,
+        ipAddress: log.ipAddress || '127.0.0.1',
+        status: isFailure ? 'FAILURE' : 'SUCCESS',
+        resource: log.action.split('_').slice(1).join(' ') || log.action
+      };
     });
 
-    return res.status(200).json({ success: true, data: logs, meta: { total: logs.length } });
+    return res.status(200).json({
+      success: true,
+      data: enrichedLogs,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1
+      }
+    });
   } catch (err) { next(err); }
 };
 
@@ -977,7 +1270,7 @@ const createUser = async (req, res, next) => {
         employeeProfile: {
           create: {
             fullName: name,
-            employeeId: 'EMP-' + Math.floor(Math.random() * 100000),
+            employeeId: 'EMP-' + Date.now().toString().slice(-6),
             departmentId: req.body.departmentId || undefined,
             ...(salaryVal !== null && !isNaN(salaryVal) && salaryVal > 0 && {
               compensationProfile: {
@@ -1011,7 +1304,9 @@ const createUser = async (req, res, next) => {
       });
     }
 
-    return res.status(201).json({ success: true, data: user });
+    const safeUser = { ...user };
+    delete safeUser.passwordHash;
+    return res.status(201).json({ success: true, data: safeUser });
   } catch (err) { next(err); }
 };
 
@@ -1072,7 +1367,7 @@ const updateUser = async (req, res, next) => {
         } : {
           create: {
             fullName: name || (email || existingUser.email).split('@')[0],
-            employeeId: 'EMP-' + Math.floor(Math.random() * 100000),
+            employeeId: 'EMP-' + Date.now().toString().slice(-6),
             ...empData
           }
         }
@@ -1129,7 +1424,9 @@ const updateUser = async (req, res, next) => {
       }
     });
 
-    return res.status(200).json({ success: true, data: finalUser || user });
+    const safeUser = { ...(finalUser || user) };
+    delete safeUser.passwordHash;
+    return res.status(200).json({ success: true, data: safeUser });
   } catch (err) { next(err); }
 };
 
@@ -1937,32 +2234,62 @@ const updateOrgSubscription = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+const DEFAULT_GLOBAL_SETTINGS = {
+  platformMode: 'Production',
+  maxOrgs: 'Unlimited',
+  defaultTimezone: 'UTC+00:00 (London)',
+  masterCurrency: 'USD ($) - US Dollar',
+  defaultCurrency: 'USD',
+  defaultPhoneCountry: '+1',
+  dateFormat: 'DD/MM/YYYY',
+  globalMFA: true,
+  auditLogRetention: '90 Days',
+  failedLoginAttempts: 5,
+  ipWhitelisting: false,
+  basePricePerUser: 8.00,
+  freeTrialDays: 14,
+  gracePeriodDays: 7,
+  invoiceInterval: 'Monthly',
+  primaryModel: 'Google Gemini 1.5 Pro',
+  resumeScanAutoRank: true,
+  matchingThreshold: 75,
+  apiRateLimit: 1200,
+  reimbursementManagerApproval: true,
+  reimbursementFinalApprovalRole: 'ADMIN'
+};
+
+const ALLOWED_GLOBAL_SETTINGS = [
+  'platformMode', 'maxOrgs', 'defaultTimezone', 'masterCurrency',
+  'defaultCurrency', 'defaultPhoneCountry', 'dateFormat',
+  'globalMFA', 'auditLogRetention', 'failedLoginAttempts', 'ipWhitelisting',
+  'basePricePerUser', 'freeTrialDays', 'gracePeriodDays', 'invoiceInterval',
+  'primaryModel', 'resumeScanAutoRank', 'matchingThreshold', 'apiRateLimit',
+  'reimbursementManagerApproval', 'reimbursementFinalApprovalRole'
+];
+
 // GET /api/superadmin/settings
 const getSystemSettings = async (req, res, next) => {
   try {
     let settings = await prisma.globalSettings.findFirst();
     if (!settings) {
       settings = await prisma.globalSettings.create({
-        data: { id: "global-settings" }
+        data: { id: "global-settings", ...DEFAULT_GLOBAL_SETTINGS }
       });
     }
 
-    const safeSettings = { ...settings };
-    if (safeSettings.smtpPassword) safeSettings.smtpPassword = '••••••••';
-    if (safeSettings.apiKey) safeSettings.apiKey = '••••••••';
-
-    return res.status(200).json({ success: true, data: safeSettings });
+    return res.status(200).json({ success: true, data: settings });
   } catch (err) { next(err); }
 };
 
 // PUT /api/superadmin/settings
 const updateSystemSettings = async (req, res, next) => {
   try {
-    const data = { ...req.body };
-    delete data.id;
-
-    if (data.smtpPassword === '••••••••') delete data.smtpPassword;
-    if (data.apiKey === '••••••••') delete data.apiKey;
+    const data = {};
+    for (const key of ALLOWED_GLOBAL_SETTINGS) {
+      if (req.body[key] !== undefined) {
+        data[key] = req.body[key];
+      }
+    }
 
     const existing = await prisma.globalSettings.findFirst();
     let updated;
@@ -1974,35 +2301,92 @@ const updateSystemSettings = async (req, res, next) => {
       });
     } else {
       updated = await prisma.globalSettings.create({
-        data: { id: "global-settings", ...data }
+        data: { id: "global-settings", ...DEFAULT_GLOBAL_SETTINGS, ...data }
       });
     }
 
-    try {
-      await prisma.auditLog.create({
-        data: {
-          userId: req.user.userId,
-          action: 'UPDATE_SYSTEM_SETTINGS',
-          details: `Updated platform global settings`,
-          ipAddress: req.ip || req.socket.remoteAddress
-        }
+    if (req.user) {
+      try {
+        await prisma.auditLog.create({
+          data: {
+            userId: req.user.userId,
+            action: 'UPDATE_SYSTEM_SETTINGS',
+            details: `Updated platform global settings: ${Object.keys(data).join(', ')}`,
+            ipAddress: req.ip || req.socket.remoteAddress
+          }
+        });
+      } catch (aErr) {}
+    }
+
+    return res.status(200).json({ 
+      success: true, 
+      data: updated, 
+      message: 'Global platform settings updated successfully.' 
+    });
+  } catch (err) { next(err); }
+};
+
+// POST /api/superadmin/settings/reset
+const resetSystemSettings = async (req, res, next) => {
+  try {
+    const existing = await prisma.globalSettings.findFirst();
+    let updated;
+
+    if (existing) {
+      updated = await prisma.globalSettings.update({
+        where: { id: existing.id },
+        data: DEFAULT_GLOBAL_SETTINGS
       });
-    } catch (aErr) {}
+    } else {
+      updated = await prisma.globalSettings.create({
+        data: { id: "global-settings", ...DEFAULT_GLOBAL_SETTINGS }
+      });
+    }
 
-    const safeSettings = { ...updated };
-    if (safeSettings.smtpPassword) safeSettings.smtpPassword = '••••••••';
-    if (safeSettings.apiKey) safeSettings.apiKey = '••••••••';
+    if (req.user) {
+      try {
+        await prisma.auditLog.create({
+          data: {
+            userId: req.user.userId,
+            action: 'RESET_SYSTEM_SETTINGS',
+            details: 'Restored platform global settings to factory defaults',
+            ipAddress: req.ip || req.socket.remoteAddress
+          }
+        });
+      } catch (aErr) {}
+    }
 
-    return res.status(200).json({ success: true, data: safeSettings, message: 'Global system settings updated successfully.' });
+    return res.status(200).json({
+      success: true,
+      data: updated,
+      message: 'Global platform settings restored to factory defaults.'
+    });
   } catch (err) { next(err); }
 };
 
 // ─────────────────────────────────────────
 // GLOBAL USAGE ANALYTICS  →  GET /api/superadmin/usage
 // ─────────────────────────────────────────
+const parseStorageBytes = (sizeStr) => {
+  if (!sizeStr) return 0;
+  if (typeof sizeStr === 'number') return sizeStr;
+  const match = String(sizeStr).trim().match(/^([\d.]+)\s*(B|KB|MB|GB|TB)?$/i);
+  if (!match) return 0;
+  const val = parseFloat(match[1]) || 0;
+  const unit = (match[2] || 'B').toUpperCase();
+  switch (unit) {
+    case 'B': return val;
+    case 'KB': return val * 1024;
+    case 'MB': return val * 1024 * 1024;
+    case 'GB': return val * 1024 * 1024 * 1024;
+    case 'TB': return val * 1024 * 1024 * 1024 * 1024;
+    default: return val;
+  }
+};
+
 const getGlobalUsage = async (req, res, next) => {
   try {
-    const [organizations, totalUsers, totalEmployees, totalAiLogs, totalDocs] = await Promise.all([
+    const [organizations, totalUsers, totalEmployees, totalAiLogs, totalDocs, allDocuments, completedBackups] = await Promise.all([
       prisma.organization.findMany({
         include: {
           pricingPlan: true,
@@ -2010,6 +2394,7 @@ const getGlobalUsage = async (req, res, next) => {
             select: {
               users: true,
               employeeProfiles: true,
+              documents: true,
             }
           }
         },
@@ -2018,57 +2403,133 @@ const getGlobalUsage = async (req, res, next) => {
       prisma.user.count(),
       prisma.employeeProfile.count(),
       prisma.aiLog.count(),
-      prisma.employeeDocument ? prisma.employeeDocument.count().catch(() => 0) : 0
+      prisma.document.count(),
+      prisma.document.findMany({
+        select: {
+          id: true,
+          organizationId: true,
+          size: true,
+          user: {
+            select: { organizationId: true }
+          }
+        }
+      }),
+      prisma.backupJob.findMany({
+        where: { status: 'COMPLETED' },
+        select: {
+          organizationId: true,
+          fileSize: true
+        }
+      })
     ]);
 
+    // Aggregate storage per organization strictly from DB document sizes and completed backups
+    const orgStorageBytesMap = new Map();
+    const orgDocCountMap = new Map();
+
+    for (const doc of allDocuments) {
+      const orgId = doc.organizationId || doc.user?.organizationId;
+      if (orgId) {
+        orgDocCountMap.set(orgId, (orgDocCountMap.get(orgId) || 0) + 1);
+        const bytes = parseStorageBytes(doc.size);
+        orgStorageBytesMap.set(orgId, (orgStorageBytesMap.get(orgId) || 0) + bytes);
+      }
+    }
+
+    for (const backup of completedBackups) {
+      if (backup.organizationId && backup.fileSize) {
+        const bytes = Number(backup.fileSize);
+        orgStorageBytesMap.set(backup.organizationId, (orgStorageBytesMap.get(backup.organizationId) || 0) + bytes);
+      }
+    }
+
     let totalAllocatedSeats = 0;
-    let totalStorageUsedGB = 0;
-    let totalMaxStorageGB = 0;
+    let totalStorageUsedBytes = 0;
+    let totalStorageCapacityGB = 0;
 
     const tenantBreakdown = organizations.map(org => {
-      const seatLimit = org.maxEmployees || org.pricingPlan?.maxEmployees || 50;
-      const currentEmployees = org._count?.employeeProfiles || 0;
-      const storageLimit = org.maxStorageGB || org.pricingPlan?.maxStorageGB || 20;
-      
-      // Estimated storage based on employee profile & document count
-      const estimatedStorageGB = Math.max(0.5, Number(((currentEmployees * 0.08) + 0.2).toFixed(2)));
-      
-      totalAllocatedSeats += seatLimit;
-      totalStorageUsedGB += estimatedStorageGB;
-      totalMaxStorageGB += storageLimit;
+      const plan = org.pricingPlan;
+      const allocatedSeats = plan ? (plan.maxEmployees || 0) : 0;
+      const storageCapacityGB = plan ? (plan.storageLimit || 0) : 0;
+
+      const usersCount = org._count?.users || 0;
+      const employeesCount = org._count?.employeeProfiles || 0;
+      const usedSeats = usersCount;
+
+      const docCount = orgDocCountMap.get(org.id) || org._count?.documents || 0;
+      const storageBytes = orgStorageBytesMap.get(org.id) || 0;
+      const storageUsedMB = Number((storageBytes / (1024 * 1024)).toFixed(2));
+      const storageUsedGB = Number((storageBytes / (1024 * 1024 * 1024)).toFixed(4));
+
+      totalAllocatedSeats += allocatedSeats;
+      totalStorageUsedBytes += storageBytes;
+      totalStorageCapacityGB += storageCapacityGB;
+
+      const seatUtilizationPct = allocatedSeats > 0 
+        ? Math.min(100, Math.round((usedSeats / allocatedSeats) * 100)) 
+        : 0;
+
+      const storageUtilizationPct = storageCapacityGB > 0 
+        ? Math.min(100, Math.round((storageUsedGB / storageCapacityGB) * 100)) 
+        : 0;
+
+      const usagePct = allocatedSeats > 0 ? seatUtilizationPct : 0;
 
       return {
         id: org.id,
         name: org.name,
-        slug: org.slug,
-        plan: org.plan || org.pricingPlan?.name || 'Professional',
-        status: org.status || 'Active',
-        currentEmployees,
-        maxEmployees: seatLimit,
-        seatUtilizationPct: Math.min(100, Math.round((currentEmployees / (seatLimit || 1)) * 100)),
-        storageUsedGB: estimatedStorageGB,
-        maxStorageGB: storageLimit,
-        storageUtilizationPct: Math.min(100, Math.round((estimatedStorageGB / (storageLimit || 1)) * 100)),
-        totalUsers: org._count?.users || 0,
+        slug: org.slug || org.name.toLowerCase().replace(/[^a-z0-9]/g, '-'),
+        plan: plan?.name || 'Unassigned',
+        status: org.status || 'ACTIVE',
+        subscriptionStatus: org.subscriptionStatus || 'TRIAL',
+        usersCount,
+        employeesCount,
+        usedSeats,
+        allocatedSeats,
+        seatUtilizationPct,
+        documentsCount: docCount,
+        storageUsedBytes: storageBytes,
+        storageUsedMB,
+        storageUsedGB,
+        storageCapacityGB,
+        storageUtilizationPct,
+        aiUsage: 0,
+        usagePct,
         createdAt: org.createdAt
       };
     });
+
+    const totalStorageUsedMB = Number((totalStorageUsedBytes / (1024 * 1024)).toFixed(2));
+    const totalStorageUsedGB = Number((totalStorageUsedBytes / (1024 * 1024 * 1024)).toFixed(4));
+    const totalUsedSeats = totalUsers;
+    const seatUtilizationPct = totalAllocatedSeats > 0 
+      ? Math.round((totalUsedSeats / totalAllocatedSeats) * 100) 
+      : 0;
+    const storageUtilizationPct = totalStorageCapacityGB > 0 
+      ? Number(((totalStorageUsedGB / totalStorageCapacityGB) * 100).toFixed(1)) 
+      : 0;
 
     return res.status(200).json({
       success: true,
       data: {
         summary: {
           totalOrganizations: organizations.length,
-          activeOrganizations: organizations.filter(o => (o.status || '').toLowerCase() === 'active').length,
-          trialOrganizations: organizations.filter(o => (o.status || '').toLowerCase() === 'trial' || (o.plan || '').toLowerCase() === 'trial').length,
-          suspendedOrganizations: organizations.filter(o => (o.status || '').toLowerCase() === 'suspended').length,
-          totalEmployees,
+          tenantCount: organizations.length,
+          activeOrganizations: organizations.filter(o => (o.status || '').toUpperCase() === 'ACTIVE').length,
+          trialOrganizations: organizations.filter(o => (o.subscriptionStatus || '').toUpperCase() === 'TRIAL').length,
+          suspendedOrganizations: organizations.filter(o => ['SUSPENDED', 'INACTIVE'].includes((o.status || '').toUpperCase())).length,
           totalAllocatedSeats,
+          totalUsedSeats,
+          totalEmployees,
           totalUsers,
-          totalStorageUsedGB: Number(totalStorageUsedGB.toFixed(2)),
-          totalMaxStorageGB,
-          totalAiRequests: totalAiLogs,
-          totalDocuments: totalDocs
+          seatUtilizationPct,
+          totalDocuments: totalDocs,
+          totalStorageUsedBytes,
+          totalStorageUsedMB,
+          totalStorageUsedGB,
+          totalStorageCapacityGB,
+          storageUtilizationPct,
+          totalAiRequests: totalAiLogs
         },
         tenants: tenantBreakdown
       }
@@ -2079,45 +2540,72 @@ const getGlobalUsage = async (req, res, next) => {
 // ─────────────────────────────────────────
 // PLATFORM FEATURE MANAGEMENT  →  GET /api/superadmin/features
 // ─────────────────────────────────────────
-const STANDARD_MODULE_FEATURES = [
-  { id: 'attendance_leave', name: 'Attendance & Leave Tracking', category: 'Core HR', description: 'Web clock-in/out, timesheets, and leave management' },
-  { id: 'employee_directory', name: 'Employee Directory & Profiles', category: 'Core HR', description: 'Centralized employee records, docs, and org charts' },
-  { id: 'shifts_calendars', name: 'Shifts & Work Calendars', category: 'Core HR', description: 'Shift rotations, work calendar versions, and holiday schedules' },
-  { id: 'payroll_operations', name: 'Payroll & Compensation', category: 'Payroll', description: 'Salary components, deductions, tax brackets & pay runs' },
-  { id: 'benefits_insurance', name: 'Benefits & Insurance Config', category: 'Benefits', description: 'Employee insurance schemes and wellness allowances' },
-  { id: 'recruitment_pipeline', name: 'Recruitment & Job Pipeline', category: 'Recruitment', description: 'Job posts, Kanban candidate funnel, and offer letters' },
-  { id: 'ai_resume_scoring', name: 'AI Resume Scoring & Matching', category: 'AI & Automation', description: 'Automated resume analysis, scoring, and matching' },
-  { id: 'performance_kpi', name: 'Performance & KPI Tracking', category: 'Performance', description: '1-on-1 reviews, objectives, and KPI targets' },
-  { id: 'approval_workflows', name: 'Custom Approval Workflows', category: 'Automation', description: 'Multi-level approval chains for leaves & expenses' },
-  { id: 'documents_vault', name: 'Document Vault & Storage', category: 'Documents', description: 'Secure document storage, categories, and employee vault' },
-  { id: 'support_tickets', name: 'Help Desk & Support Tickets', category: 'Support', description: 'Internal support tickets, communication threads, and SLA tracking' },
-  { id: 'backup_center', name: 'Organization Backup Center', category: 'Data & Backup', description: 'Tenant data & documents export, Google Drive sync, and archives' },
-  { id: 'offboarding_exit', name: 'Offboarding & Exit Lifecycle', category: 'Core HR', description: 'Resignations, clearance checklists, and exit interviews' },
-  { id: 'advanced_reports', name: 'Advanced Analytics & Exports', category: 'Analytics', description: 'Custom report builder and scheduled automated exports' },
-  { id: 'audit_compliance', name: 'Audit Logs & Statutory Compliance', category: 'Security', description: 'Granular audit logs and compliance policy center' }
+const SEED_PLATFORM_FEATURES = [
+  { id: 'attendance_leave', name: 'Attendance & Leave Tracking', category: 'Core HR', description: 'Web clock-in/out, timesheets, and leave management', displayOrder: 1 },
+  { id: 'employee_directory', name: 'Employee Directory & Profiles', category: 'Core HR', description: 'Centralized employee records, docs, and org charts', displayOrder: 2 },
+  { id: 'shifts_calendars', name: 'Shifts & Work Calendars', category: 'Core HR', description: 'Shift rotations, work calendar versions, and holiday schedules', displayOrder: 3 },
+  { id: 'payroll_operations', name: 'Payroll & Compensation', category: 'Payroll', description: 'Salary components, deductions, tax brackets & pay runs', displayOrder: 4 },
+  { id: 'benefits_insurance', name: 'Benefits & Insurance Config', category: 'Benefits', description: 'Employee insurance schemes and wellness allowances', displayOrder: 5 },
+  { id: 'recruitment_pipeline', name: 'Recruitment & Job Pipeline', category: 'Recruitment', description: 'Job posts, Kanban candidate funnel, and offer letters', displayOrder: 6 },
+  { id: 'ai_resume_scoring', name: 'AI Resume Scoring & Matching', category: 'AI & Automation', description: 'Automated resume analysis, scoring, and matching', displayOrder: 7 },
+  { id: 'performance_kpi', name: 'Performance & KPI Tracking', category: 'Performance', description: '1-on-1 reviews, objectives, and KPI targets', displayOrder: 8 },
+  { id: 'approval_workflows', name: 'Custom Approval Workflows', category: 'Automation', description: 'Multi-level approval chains for leaves & expenses', displayOrder: 9 },
+  { id: 'documents_vault', name: 'Document Vault & Storage', category: 'Documents', description: 'Secure document storage, categories, and employee vault', displayOrder: 10 },
+  { id: 'support_tickets', name: 'Help Desk & Support Tickets', category: 'Support', description: 'Internal support tickets, communication threads, and SLA tracking', displayOrder: 11 },
+  { id: 'backup_center', name: 'Organization Backup Center', category: 'Data & Backup', description: 'Tenant data & documents export, Google Drive sync, and archives', displayOrder: 12 },
+  { id: 'offboarding_exit', name: 'Offboarding & Exit Lifecycle', category: 'Core HR', description: 'Resignations, clearance checklists, and exit interviews', displayOrder: 13 },
+  { id: 'advanced_reports', name: 'Advanced Analytics & Exports', category: 'Analytics', description: 'Custom report builder and scheduled automated exports', displayOrder: 14 },
+  { id: 'audit_compliance', name: 'Audit Logs & Statutory Compliance', category: 'Security', description: 'Granular audit logs and compliance policy center', displayOrder: 15 }
 ];
 
-const standardFeatureIdSet = new Set(STANDARD_MODULE_FEATURES.map(f => f.id));
+const ensurePlatformFeaturesSeeded = async () => {
+  try {
+    const count = await prisma.platformFeature.count();
+    if (count === 0) {
+      for (const feat of SEED_PLATFORM_FEATURES) {
+        await prisma.platformFeature.upsert({
+          where: { id: feat.id },
+          update: feat,
+          create: feat
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Error seeding platform features:', err);
+  }
+};
 
-const getDefaultFeaturesForPlan = (planName, monthlyPrice = 0) => {
+const getDefaultFeaturesForPlan = (planName, monthlyPrice = 0, allFeatureIds = []) => {
   const lower = (planName || '').toLowerCase();
   if (lower.includes('enterprise') || lower.includes('unlimited')) {
-    return STANDARD_MODULE_FEATURES.map(f => f.id);
+    return allFeatureIds;
   } else if (lower.includes('pro') || lower.includes('growth') || lower.includes('demanded') || monthlyPrice >= 30) {
     return [
       'attendance_leave', 'employee_directory', 'shifts_calendars', 'payroll_operations',
       'benefits_insurance', 'recruitment_pipeline', 'ai_resume_scoring', 'performance_kpi',
       'approval_workflows', 'documents_vault', 'support_tickets', 'backup_center',
       'offboarding_exit', 'audit_compliance'
-    ];
+    ].filter(id => allFeatureIds.includes(id));
   } else {
-    return ['attendance_leave', 'employee_directory', 'performance_kpi', 'support_tickets', 'documents_vault'];
+    return ['attendance_leave', 'employee_directory', 'performance_kpi', 'support_tickets', 'documents_vault']
+      .filter(id => allFeatureIds.includes(id));
   }
 };
 
 const getPlatformFeatures = async (req, res, next) => {
   try {
-    // 1. Fetch real active pricing plans from the database
+    // 1. Authoritative feature source of truth from database
+    await ensurePlatformFeaturesSeeded();
+    const dbFeatures = await prisma.platformFeature.findMany({
+      where: { isActive: true },
+      orderBy: { displayOrder: 'asc' }
+    });
+
+    const activeFeatureIdSet = new Set(dbFeatures.map(f => f.id));
+    const allFeatureIds = dbFeatures.map(f => f.id);
+    const dynamicCategories = ['ALL', ...Array.from(new Set(dbFeatures.map(f => f.category)))];
+
+    // 2. Fetch real active pricing plans from database
     let dbPlans = await prisma.pricingPlan.findMany({
       where: { isActive: true },
       include: { features: { orderBy: { displayOrder: 'asc' } } },
@@ -2144,15 +2632,15 @@ const getPlatformFeatures = async (req, res, next) => {
         isPopular: plan.isPopular
       });
 
-      // Filter for features that match standard feature IDs
-      const assigned = plan.features.map(f => f.feature).filter(f => standardFeatureIdSet.has(f));
+      // Filter for features that match standard feature IDs in DB
+      const assigned = plan.features.map(f => f.feature).filter(f => activeFeatureIdSet.has(f));
 
       if (assigned.length > 0) {
         plansFeaturesMap[plan.name] = assigned;
         plansFeaturesMap[plan.id] = assigned;
       } else {
         // Fallback to default tier feature set and auto-persist so it remains stored in DB
-        const defaultFeats = getDefaultFeaturesForPlan(plan.name, plan.monthlyPrice);
+        const defaultFeats = getDefaultFeaturesForPlan(plan.name, plan.monthlyPrice, allFeatureIds);
         plansFeaturesMap[plan.name] = defaultFeats;
         plansFeaturesMap[plan.id] = defaultFeats;
 
@@ -2174,7 +2662,8 @@ const getPlatformFeatures = async (req, res, next) => {
     return res.status(200).json({
       success: true,
       data: {
-        features: STANDARD_MODULE_FEATURES,
+        features: dbFeatures,
+        categories: dynamicCategories,
         plans: plansFeaturesMap,
         plansList: plansList.length > 0 ? plansList : [
           { id: '1', name: 'Starter', monthlyPrice: 15, currency: '$', maxEmployees: 15 },
@@ -2230,7 +2719,7 @@ const updatePlatformFeatures = async (req, res, next) => {
           userId,
           action: 'UPDATE_FEATURE_ENTITLEMENTS',
           details: `Updated SaaS feature matrix for plans: ${Object.keys(plans).join(', ')}`,
-          ipAddress: req.ip || req.socket.remoteAddress
+          ipAddress: req.ip || req.socket?.remoteAddress
         }
       }).catch(() => {});
     }
@@ -2283,15 +2772,32 @@ const togglePlatformFeature = async (req, res, next) => {
       });
     }
 
+    // Audit log
+    const userId = req.user?.userId || req.user?.id;
+    if (userId) {
+      await prisma.auditLog.create({
+        data: {
+          userId,
+          action: 'TOGGLE_FEATURE_ENTITLEMENT',
+          details: `${isEnabled ? 'Enabled' : 'Disabled'} feature '${featureId}' for plan '${plan.name}'`,
+          ipAddress: req.ip || req.socket?.remoteAddress
+        }
+      }).catch(() => {});
+    }
+
     // Return updated feature list for this plan
     const updatedPlan = await prisma.pricingPlan.findUnique({
       where: { id: plan.id },
       include: { features: true }
     });
 
+    // Check DB active features
+    const dbFeatures = await prisma.platformFeature.findMany({ where: { isActive: true } });
+    const activeFeatureIdSet = new Set(dbFeatures.map(f => f.id));
+
     const activeFeatures = (updatedPlan?.features || [])
       .map(f => f.feature)
-      .filter(f => standardFeatureIdSet.has(f));
+      .filter(f => activeFeatureIdSet.has(f));
 
     return res.status(200).json({
       success: true,
@@ -2309,7 +2815,7 @@ const togglePlatformFeature = async (req, res, next) => {
 
 module.exports = {
   getPlatformStats,
-  getAllOrganizations, getOrganizationDetails, provisionOrganization, suspendOrganization, activateOrganization, createOrganization, deleteOrganization, updateOrgSubscription,
+  getAllOrganizations, getOrganizationDetails, provisionOrganization, suspendOrganization, activateOrganization, createOrganization, deleteOrganization, updateOrganization, updateOrgSubscription,
   getAllPlatformUsers, createAdminForOrg,
   toggleAnyUserActive, changeAnyUserRole, revokeAnyUserRole,
   getPlatformAuditLogs,
@@ -2321,7 +2827,7 @@ module.exports = {
   getPayrollSettings, updatePayrollSettings,
   getPayrollHistory, createPayslip, updatePayslip, deletePayslip, bulkApprovePayslips, generatePayroll,
   resetUserPassword,
-  getSystemSettings, updateSystemSettings,
+  getSystemSettings, updateSystemSettings, resetSystemSettings,
   getGlobalUsage,
   getPlatformFeatures,
   updatePlatformFeatures,

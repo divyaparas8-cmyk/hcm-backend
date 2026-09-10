@@ -459,3 +459,195 @@ exports.rejectHRIncrementRequest = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+
+// ==========================================
+// GET /api/employee/payroll  (unified endpoint)
+// ==========================================
+exports.getEmployeePayroll = async (req, res) => {
+  try {
+    // Resolve employeeProfileId
+    const emp = await prisma.employeeProfile.findUnique({
+      where: { userId: req.user.userId },
+      include: { user: { select: { organizationId: true } } }
+    });
+    if (!emp) return res.status(404).json({ success: false, error: { message: 'Employee profile not found.' } });
+
+    // Fetch CompensationProfile
+    const compensation = await prisma.compensationProfile.findUnique({
+      where: { employeeId: emp.id },
+      include: { salaryStructure: true, salaryBand: true, salaryVersion: true }
+    });
+
+    // Fetch PayrollSnapshots (most recent first)
+    const snapshots = await prisma.payrollSnapshot.findMany({
+      where: { employeeId: emp.id },
+      include: {
+        items: true,
+        salaryStructureVersion: { include: { structure: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    // Format payslips for frontend
+    const payslips = snapshots.map(s => ({
+      id: s.id,
+      month: s.month,
+      grossSalary: s.grossSalary,
+      totalDeductions: s.totalDeductions,
+      netSalary: s.netSalary,
+      status: s.status,
+      paymentDate: s.paymentDate,
+      totalWorkingDays: s.totalWorkingDays,
+      presentDays: s.presentDays,
+      paidLeaveDays: s.paidLeaveDays,
+      unpaidLeaveDays: s.unpaidLeaveDays,
+      items: s.items,
+      employeeName: emp.fullName,
+      employeeCode: emp.employeeId,
+      designation: emp.designation,
+    }));
+
+    // Resolve salary structure name
+    let salaryStructureName = 'Not assigned';
+    if (compensation?.salaryStructure?.name) {
+      salaryStructureName = compensation.salaryStructure.name;
+    } else if (compensation?.salaryBand?.name) {
+      salaryStructureName = `Band: ${compensation.salaryBand.name}`;
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        salaryStructure: salaryStructureName,
+        monthlyCTC: compensation?.monthlyCTC || 0,
+        annualCTC: compensation?.annualCTC || 0,
+        currency: compensation?.currency || 'USD',
+        salaryBand: compensation?.salaryBand?.name || null,
+        status: compensation?.status || null,
+        payslips
+      }
+    });
+  } catch (error) {
+    console.error('getEmployeePayroll error:', error);
+    return res.status(500).json({ success: false, error: { message: error.message } });
+  }
+};
+
+// ==========================================
+// GET /api/employee/payslip/:id/download
+// ==========================================
+exports.downloadPayslip = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Find snapshot and verify ownership
+    const emp = await prisma.employeeProfile.findUnique({ where: { userId: req.user.userId } });
+    if (!emp) return res.status(403).json({ success: false, error: { message: 'Access denied.' } });
+
+    const snapshot = await prisma.payrollSnapshot.findFirst({
+      where: { id, employeeId: emp.id },
+      include: { items: true }
+    });
+    if (!snapshot) return res.status(404).json({ success: false, error: { message: 'Payslip not found.' } });
+
+    // Get org name for header
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, include: { organization: { select: { name: true } } } });
+    const orgName = user?.organization?.name || 'GlobalTech Solutions';
+
+    // Generate PDF with pdfkit
+    const PDFDocument = require('pdfkit');
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+
+    const filename = `Payslip_${snapshot.month.replace(/[^a-zA-Z0-9_-]/g, '_')}_${emp.employeeId || emp.id.slice(0, 8)}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    doc.pipe(res);
+
+    // ── Header ──
+    doc.fontSize(18).font('Helvetica-Bold').text(orgName, 50, 50);
+    doc.fontSize(9).font('Helvetica').fillColor('#94a3b8').text('Enterprise Employee Paystub', 50, 72);
+    doc.fontSize(9).fillColor('#94a3b8')
+      .text(`PAYSLIP ID: ${snapshot.id.slice(0, 8).toUpperCase()}`, 400, 50, { align: 'right' })
+      .text(`Month: ${snapshot.month}`, 400, 63, { align: 'right' });
+
+    doc.moveTo(50, 90).lineTo(545, 90).strokeColor('#e2e8f0').stroke();
+
+    // ── Employee Details & Attendance ──
+    doc.moveDown(2);
+    const y1 = 105;
+    doc.fontSize(7).font('Helvetica-Bold').fillColor('#94a3b8').text('EMPLOYEE DETAILS', 50, y1);
+    doc.fontSize(10).font('Helvetica-Bold').fillColor('#1e293b').text(emp.fullName || 'Employee', 50, y1 + 12);
+    doc.fontSize(8).font('Helvetica').fillColor('#64748b')
+      .text(`Employee ID: ${emp.employeeId || 'N/A'}`, 50, y1 + 26)
+      .text(`Designation: ${emp.designation || 'N/A'}`, 50, y1 + 38);
+
+    doc.fontSize(7).font('Helvetica-Bold').fillColor('#94a3b8').text('ATTENDANCE SUMMARY', 300, y1, { align: 'left' });
+    doc.fontSize(8).font('Helvetica').fillColor('#64748b')
+      .text(`Working Days: ${snapshot.totalWorkingDays ?? 0}`, 300, y1 + 12)
+      .text(`Days Present: ${snapshot.presentDays ?? 0}`, 300, y1 + 24)
+      .text(`Paid Leaves: ${snapshot.paidLeaveDays ?? 0}`, 300, y1 + 36)
+      .text(`LOP Days: ${snapshot.unpaidLeaveDays ?? 0}`, 300, y1 + 48);
+
+    doc.moveTo(50, y1 + 62).lineTo(545, y1 + 62).strokeColor('#e2e8f0').stroke();
+
+    // ── Earnings & Deductions ──
+    const earnings = (snapshot.items || []).filter(i => ['Earning', 'Allowance', 'Variable Pay'].includes(i.type));
+    const deductions = (snapshot.items || []).filter(i => i.type === 'Deduction');
+
+    let yE = y1 + 75;
+    doc.fontSize(7).font('Helvetica-Bold').fillColor('#10b981').text('EARNINGS', 50, yE);
+    doc.fontSize(7).font('Helvetica-Bold').fillColor('#ef4444').text('DEDUCTIONS', 300, yE);
+    yE += 14;
+
+    const maxRows = Math.max(earnings.length || 1, deductions.length || 1);
+    for (let i = 0; i < maxRows; i++) {
+      const e = earnings[i];
+      const d = deductions[i];
+      const rowBg = i % 2 === 0 ? '#f8fafc' : '#ffffff';
+      doc.rect(50, yE - 2, 495, 16).fill(rowBg).fillColor('#1e293b');
+      if (e) {
+        doc.fontSize(8).font('Helvetica').fillColor('#374151').text(e.name, 55, yE).text(`${Number(e.amount).toLocaleString('en', { style: 'currency', currency: snapshot.currency || 'USD' })}`, 200, yE, { align: 'right', width: 70 });
+      }
+      if (d) {
+        doc.fontSize(8).font('Helvetica').fillColor('#374151').text(d.name, 305, yE).text(`-${Number(d.amount).toLocaleString('en', { style: 'currency', currency: snapshot.currency || 'USD' })}`, 450, yE, { align: 'right', width: 95 });
+      }
+      yE += 16;
+    }
+
+    // Totals row
+    yE += 4;
+    doc.moveTo(50, yE).lineTo(545, yE).strokeColor('#e2e8f0').stroke();
+    yE += 8;
+    doc.fontSize(8).font('Helvetica-Bold').fillColor('#1e293b')
+      .text('Gross Earnings', 55, yE)
+      .text(`${Number(snapshot.grossSalary).toLocaleString('en', { style: 'currency', currency: 'USD' })}`, 200, yE, { align: 'right', width: 70 });
+    doc.fontSize(8).font('Helvetica-Bold').fillColor('#1e293b')
+      .text('Total Withheld', 305, yE)
+      .text(`-${Number(snapshot.totalDeductions).toLocaleString('en', { style: 'currency', currency: 'USD' })}`, 450, yE, { align: 'right', width: 95 });
+
+    // ── Net Pay Box ──
+    yE += 30;
+    doc.rect(50, yE, 495, 55).fill('#f0fdf4').fillColor('#1e293b');
+    doc.moveTo(50, yE).lineTo(545, yE).strokeColor('#86efac').lineWidth(1).stroke();
+    doc.moveTo(50, yE + 55).lineTo(545, yE + 55).strokeColor('#86efac').lineWidth(1).stroke();
+    doc.fontSize(8).font('Helvetica-Bold').fillColor('#16a34a').text('NET SALARY PAYABLE', 65, yE + 10);
+    doc.fontSize(22).font('Helvetica-Bold').fillColor('#15803d')
+      .text(`${Number(snapshot.netSalary).toLocaleString('en', { style: 'currency', currency: 'USD' })}`, 65, yE + 22);
+    const statusColor = ['Paid', 'Processed'].includes(snapshot.status) ? '#16a34a' : '#d97706';
+    const statusBg = ['Paid', 'Processed'].includes(snapshot.status) ? '#dcfce7' : '#fef3c7';
+    doc.rect(420, yE + 15, 70, 20).fill(statusBg);
+    doc.fontSize(8).font('Helvetica-Bold').fillColor(statusColor).text(snapshot.status.toUpperCase(), 420, yE + 21, { width: 70, align: 'center' });
+
+    // ── Footer ──
+    doc.fontSize(7).font('Helvetica').fillColor('#94a3b8')
+      .text('This is a computer-generated document and does not require a physical signature.', 50, 760, { align: 'center', width: 495 })
+      .text(`${orgName} Payroll Processing Service Platform. Confidential. © ${new Date().getFullYear()}`, 50, 771, { align: 'center', width: 495 });
+
+    doc.end();
+  } catch (error) {
+    console.error('downloadPayslip error:', error);
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, error: { message: error.message } });
+    }
+  }
+};

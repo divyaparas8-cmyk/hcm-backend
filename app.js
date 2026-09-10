@@ -109,7 +109,26 @@ app.use('/api/admin/backups',   backupRoutes);      // Organization Backup Cente
 app.use('/api/admin',           backupRoutes);      // Google Drive OAuth endpoints
 app.use('/api', approvalWorkflowRoutes); // Workflow Configuration & Actions
 app.use('/api/copilot', copilotRoutes);
+app.use('/api/ai', copilotRoutes);
 app.use('/api/upload', uploadRoutes);        // Cloud file uploads (Cloudinary/ImageKit)
+
+// ── Attendance Quick Endpoints (GET/POST /api/attendance/*) ──
+const { clockIn, clockOut, getCurrentAttendance, getAttendanceHistory } = require('./src/controllers/employeeController');
+const { protect } = require('./src/middlewares/authMiddleware');
+const tenantGuard = require('./src/middlewares/tenantGuard');
+const { checkPermission } = require('./src/middlewares/permissionMiddleware');
+const subscriptionGuard = require('./src/middlewares/subscriptionGuard');
+const attendanceQuickRouter = express.Router();
+attendanceQuickRouter.use(protect);
+attendanceQuickRouter.use(tenantGuard);
+attendanceQuickRouter.get('/current', checkPermission('attendance', 'view'), subscriptionGuard('attendance_leave'), getCurrentAttendance);
+attendanceQuickRouter.get('/history', checkPermission('attendance', 'view'), subscriptionGuard('attendance_leave'), getAttendanceHistory);
+attendanceQuickRouter.get('/', checkPermission('attendance', 'view'), subscriptionGuard('attendance_leave'), getAttendanceHistory);
+attendanceQuickRouter.post('/check-in', checkPermission('attendance', 'create'), subscriptionGuard('attendance_leave'), clockIn);
+attendanceQuickRouter.post('/check-out', checkPermission('attendance', 'create'), subscriptionGuard('attendance_leave'), clockOut);
+attendanceQuickRouter.post('/clock-in', checkPermission('attendance', 'create'), subscriptionGuard('attendance_leave'), clockIn);
+attendanceQuickRouter.post('/clock-out', checkPermission('attendance', 'create'), subscriptionGuard('attendance_leave'), clockOut);
+app.use('/api/attendance', attendanceQuickRouter);
 
 // ---- GLOBAL ERROR HANDLER (hamesha last mein) ----
 app.use(errorHandler);

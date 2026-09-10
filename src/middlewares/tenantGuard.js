@@ -19,11 +19,13 @@ const tenantGuard = async (req, res, next) => {
       });
     }
 
-    // Fetch the tenant organization with pricing plan relation
+    // Fetch the tenant organization with pricing plan relation and its features
     const org = await prisma.organization.findUnique({
       where: { id: req.user.organizationId },
       include: {
-        pricingPlan: true
+        pricingPlan: {
+          include: { features: true }
+        }
       }
     });
 
@@ -48,11 +50,31 @@ const tenantGuard = async (req, res, next) => {
       });
     }
 
+    let pricingPlan = org.pricingPlan;
+    if (!pricingPlan) {
+      pricingPlan = await prisma.pricingPlan.findFirst({
+        where: { name: 'Enterprise' },
+        include: { features: true }
+      }) || await prisma.pricingPlan.findFirst({
+        include: { features: true }
+      });
+      if (pricingPlan && !org.pricingPlanId) {
+        await prisma.organization.update({
+          where: { id: org.id },
+          data: { pricingPlanId: pricingPlan.id }
+        }).catch(() => {});
+      }
+    }
+
+    // Extract active SaaS module feature identifiers for the organization's plan
+    const assignedFeatures = (pricingPlan?.features || []).map(f => f.feature);
+
     // Pass organization and subscription helpers down
     req.tenant = {
       ...org,
-      plan: org.pricingPlan?.name || 'Professional',
-      maxEmployees: org.pricingPlan?.maxEmployees || 500,
+      plan: pricingPlan?.name || 'Enterprise',
+      maxEmployees: pricingPlan?.maxEmployees || 9999,
+      features: assignedFeatures
     };
     
     next();

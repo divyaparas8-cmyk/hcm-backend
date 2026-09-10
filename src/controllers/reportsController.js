@@ -4,6 +4,7 @@ const prisma = require('../config/prisma');
 const getHRReports = async (req, res, next) => {
   try {
     const { dateRange, department, recruiter } = req.query;
+    const organizationId = req.user?.organizationId || req.tenant?.id;
 
     // 1. Build date filter
     let dateFilter = {};
@@ -28,28 +29,42 @@ const getHRReports = async (req, res, next) => {
 
     // 2. Build where filters
     const applicationWhere = {
-      submittedAt: dateFilter,
+      ...(dateFilter.gte ? { submittedAt: dateFilter } : {}),
+      ...(organizationId ? { jobPost: { organizationId } } : {})
     };
 
     if (department) {
       applicationWhere.jobPost = {
+        ...(applicationWhere.jobPost || {}),
         department: department
       };
     }
 
     if (recruiter) {
-      // Find applications where the candidate has an interview with this recruiter
       applicationWhere.interviews = {
         some: {
           interviewer: {
-            fullName: recruiter
+            fullName: { contains: recruiter }
           }
         }
       };
     }
 
-    // 3. Fetch data from DB
-    const [allApplications, allJobs, allInterviews, allCandidates, allOffers] = await Promise.all([
+    // 3. Fetch data from DB in parallel
+    const [
+      allApplications,
+      allJobs,
+      allInterviews,
+      allCandidates,
+      allOffers,
+      allDepartments,
+      allRecruiters,
+      onboardings,
+      confirmedEmployees,
+      totalActiveEmployees,
+      totalExitedEmployees,
+      allExits
+    ] = await Promise.all([
       prisma.jobApplication.findMany({
         where: applicationWhere,
         include: {
@@ -58,49 +73,100 @@ const getHRReports = async (req, res, next) => {
             include: { interviewer: true }
           },
           candidate: true
-        }
+        },
+        orderBy: { submittedAt: 'desc' }
       }),
       prisma.jobPost.findMany({
-        where: department ? { department } : {}
+        where: {
+          ...(organizationId ? { organizationId } : {}),
+          ...(department ? { department } : {})
+        }
       }),
       prisma.interview.findMany({
-        include: { interviewer: true, application: true }
+        where: organizationId ? { application: { jobPost: { organizationId } } } : {},
+        include: { interviewer: true, application: { include: { jobPost: true } } }
       }),
       prisma.candidateProfile.findMany(),
-      prisma.offer.findMany()
+      prisma.offer.findMany({
+        where: organizationId ? { application: { jobPost: { organizationId } } } : {}
+      }),
+      prisma.department.findMany({
+        where: organizationId ? { organizationId } : {},
+        include: { employees: true }
+      }),
+      prisma.user.findMany({
+        where: {
+          ...(organizationId ? { organizationId } : {}),
+          role: { in: ['HR', 'MANAGER', 'ADMIN'] }
+        },
+        include: { employeeProfile: { include: { department: true } } }
+      }),
+      prisma.onboarding.findMany({
+        where: {
+          ...(organizationId ? { application: { jobPost: { organizationId } } } : {}),
+          status: 'Completed'
+        }
+      }),
+      prisma.employeeProfile.findMany({
+        where: {
+          ...(organizationId ? { organizationId } : {}),
+          probationStatus: 'CONFIRMED'
+        }
+      }),
+      prisma.employeeProfile.count({
+        where: {
+          ...(organizationId ? { organizationId } : {}),
+          lifecycleStatus: { in: ['ACTIVE', 'PROBATION', 'CONFIRMED'] }
+        }
+      }),
+      prisma.exitLifecycle.count({
+        where: {
+          ...(organizationId ? { employee: { organizationId } } : {}),
+          status: 'COMPLETED'
+        }
+      }),
+      prisma.exitLifecycle.findMany({
+        where: {
+          ...(organizationId ? { employee: { organizationId } } : {}),
+          status: 'COMPLETED'
+        },
+        include: { employee: { include: { user: true } } }
+      })
     ]);
 
-    // 4. Calculate Stats
+    // 4. Calculate Top Stats
     // Average Time-to-Hire
     const hiredApps = allApplications.filter(a => a.status === 'HIRED');
     let avgTimeToHire = 0;
     if (hiredApps.length > 0) {
       const totalDays = hiredApps.reduce((acc, app) => {
-        const diffTime = Math.abs(new Date(app.updatedAt) - new Date(app.submittedAt));
+        const diffTime = Math.abs(new Date(app.updatedAt || new Date()) - new Date(app.submittedAt));
         const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
         return acc + diffDays;
       }, 0);
       avgTimeToHire = Math.round(totalDays / hiredApps.length) || 0;
     }
 
-    // Application Rate
-    const applicationRate = allJobs.length > 0 ? Math.round(allApplications.length / allJobs.length) : 0;
+    // Application Rate (% of open jobs receiving applications)
+    const applicationRate = allJobs.length > 0 
+      ? Math.round((allApplications.length / allJobs.length) * 100) 
+      : (allApplications.length > 0 ? 100 : 0);
 
-    // Cost Per Hire
+    // Cost Per Hire (calculated from real offers or standard recruitment factor)
     let costPerHire = 0;
     if (allOffers.length > 0) {
       const totalSalary = allOffers.reduce((acc, offer) => {
-        const num = parseFloat(offer.salary.replace(/[^0-9.]/g, '')) || 0;
+        const num = parseFloat(String(offer.salary || '0').replace(/[^0-9.]/g, '')) || 0;
         return acc + num;
       }, 0);
-      costPerHire = Math.round((totalSalary / allOffers.length) * 0.015) || 0; // estimate cost per hire as 1.5% of avg salary
+      costPerHire = Math.round((totalSalary / allOffers.length) * 0.015) || 0;
     }
 
-    // Recruiter Score
-    const ratedInterviews = allInterviews.filter(i => i.rating !== null);
-    let recruiterScore = 4.8; // fallback
+    // Recruiter Score (from real rated interviews or 0.0)
+    const ratedInterviews = allInterviews.filter(i => i.rating !== null && i.rating !== undefined && Number(i.rating) > 0);
+    let recruiterScore = 0.0;
     if (ratedInterviews.length > 0) {
-      const totalRating = ratedInterviews.reduce((acc, i) => acc + i.rating, 0);
+      const totalRating = ratedInterviews.reduce((acc, i) => acc + Number(i.rating), 0);
       recruiterScore = parseFloat((totalRating / ratedInterviews.length).toFixed(1));
     }
 
@@ -124,7 +190,6 @@ const getHRReports = async (req, res, next) => {
         }
       }
     });
-
     const dailyPerformance = Object.values(dailyDataMap);
 
     // Weekly Performance (last 4 weeks)
@@ -136,7 +201,7 @@ const getHRReports = async (req, res, next) => {
 
     allApplications.forEach(app => {
       const appDate = new Date(app.submittedAt);
-      const diffWeeks = Math.floor((now - appDate) / (1000 * 60 * 60 * 24 * 7));
+      const diffWeeks = Math.floor((now.getTime() - appDate.getTime()) / (1000 * 60 * 60 * 24 * 7));
       if (diffWeeks >= 0 && diffWeeks < 4) {
         const name = `Week ${4 - diffWeeks}`;
         if (weeklyDataMap[name]) {
@@ -147,214 +212,232 @@ const getHRReports = async (req, res, next) => {
         }
       }
     });
-
     const weeklyPerformance = Object.values(weeklyDataMap);
 
-    // 6. Candidate Sources
+    // 6. Candidate Sources (computed from real candidates)
     let linkedinCount = 0;
-    let portfolioCount = 0;
-    let indeedCount = 0;
     let referralCount = 0;
+    let indeedCount = 0;
+    let portalCount = 0;
 
     allCandidates.forEach(cand => {
-      if (cand.linkedin && cand.linkedin.includes('linkedin')) {
+      const src = (cand.source || cand.referralSource || '').toLowerCase();
+      if (src.includes('linkedin') || (cand.linkedin && cand.linkedin.includes('linkedin'))) {
         linkedinCount += 1;
-      } else if (cand.portfolio && cand.portfolio.includes('github')) {
-        portfolioCount += 1;
-      } else if (cand.experience && parseInt(cand.experience) > 5) {
+      } else if (src.includes('referral') || src.includes('direct') || cand.referredBy) {
+        referralCount += 1;
+      } else if (src.includes('indeed')) {
         indeedCount += 1;
       } else {
-        referralCount += 1;
+        portalCount += 1;
       }
     });
 
-    const totalCands = allCandidates.length || 1;
-    const sources = [
-      { label: 'LinkedIn', value: Math.round((linkedinCount / totalCands) * 100) || 45, color: 'bg-blue-500' },
-      { label: 'Direct Referrals', value: Math.round((referralCount / totalCands) * 100) || 25, color: 'bg-emerald-500' },
-      { label: 'Indeed', value: Math.round((indeedCount / totalCands) * 100) || 15, color: 'bg-indigo-500' },
-      { label: 'Company Portal', value: Math.round((portfolioCount / totalCands) * 100) || 15, color: 'bg-amber-500' },
-    ];
-
-    // Normalize percentages to sum to 100
-    const totalVal = sources.reduce((acc, s) => acc + s.value, 0);
-    if (totalVal > 0) {
-      sources.forEach(s => {
-        s.value = Math.round((s.value / totalVal) * 100);
-      });
+    const totalCands = allCandidates.length;
+    let sources = [];
+    if (totalCands > 0) {
+      sources = [
+        { label: 'LinkedIn', value: Math.round((linkedinCount / totalCands) * 100), count: linkedinCount, color: 'bg-blue-500' },
+        { label: 'Direct Referrals', value: Math.round((referralCount / totalCands) * 100), count: referralCount, color: 'bg-emerald-500' },
+        { label: 'Indeed', value: Math.round((indeedCount / totalCands) * 100), count: indeedCount, color: 'bg-indigo-500' },
+        { label: 'Company Portal', value: Math.round((portalCount / totalCands) * 100), count: portalCount, color: 'bg-amber-500' },
+      ];
+      // Normalize to sum to 100%
+      const totalVal = sources.reduce((acc, s) => acc + s.value, 0);
+      if (totalVal > 0) {
+        sources.forEach(s => {
+          s.value = Math.round((s.value / totalVal) * 100);
+        });
+      }
+    } else {
+      sources = [
+        { label: 'Company Portal', value: 0, count: 0, color: 'bg-amber-500' },
+        { label: 'Direct Referrals', value: 0, count: 0, color: 'bg-emerald-500' },
+        { label: 'LinkedIn', value: 0, count: 0, color: 'bg-blue-500' },
+        { label: 'Indeed', value: 0, count: 0, color: 'bg-indigo-500' }
+      ];
     }
 
-    // 7. Recruiter Efficiency
+    // 7. Recruiter Efficiency (dynamically computed from all active recruiters)
     const recruitersMap = {};
 
-    // Get all unique interviewers
-    allInterviews.forEach(interview => {
-      const interviewer = interview.interviewer;
-      if (!interviewer) return;
+    allRecruiters.forEach(user => {
+      const name = user.employeeProfile?.fullName || user.email.split('@')[0];
+      recruitersMap[user.id] = {
+        id: user.id,
+        name,
+        role: user.role,
+        department: user.employeeProfile?.department?.name || 'HR',
+        rolesCount: 0,
+        appsCount: 0,
+        interviewsCount: 0,
+        totalTto: 0,
+        totalScore: 0,
+        scoreCount: 0
+      };
+    });
 
-      const name = interviewer.fullName;
-      if (!recruitersMap[name]) {
-        recruitersMap[name] = {
-          name,
-          rolesSet: new Set(),
+    // Map open roles to recruiters
+    allJobs.forEach(job => {
+      if (job.creatorId && recruitersMap[job.creatorId]) {
+        recruitersMap[job.creatorId].rolesCount += 1;
+      } else {
+        const keys = Object.keys(recruitersMap);
+        if (keys.length > 0 && job.creatorId) {
+          const firstKey = keys[0];
+          recruitersMap[firstKey].rolesCount += 1;
+        }
+      }
+    });
+
+    // Map interviews and applications
+    allInterviews.forEach(interview => {
+      const interviewerId = interview.interviewerId || interview.interviewer?.id;
+      const interviewerName = interview.interviewer?.fullName;
+      
+      let rec = null;
+      if (interviewerId && recruitersMap[interviewerId]) {
+        rec = recruitersMap[interviewerId];
+      } else if (interviewerName) {
+        rec = Object.values(recruitersMap).find(r => r.name.toLowerCase() === interviewerName.toLowerCase());
+      }
+
+      if (!rec && interviewerName) {
+        rec = {
+          id: interviewerId || interviewerName,
+          name: interviewerName,
+          role: 'Recruiter',
+          department: 'HR',
+          rolesCount: 0,
           appsCount: 0,
           interviewsCount: 0,
           totalTto: 0,
           totalScore: 0,
           scoreCount: 0
         };
+        recruitersMap[rec.id] = rec;
       }
 
-      const rec = recruitersMap[name];
-      if (interview.application) {
-        rec.rolesSet.add(interview.application.jobId);
-        rec.appsCount += 1;
-
-        // Calculate days to offer or interview
-        const submitDate = new Date(interview.application.submittedAt);
-        const interviewDate = new Date(interview.dateTime);
-        const diffDays = Math.ceil(Math.abs(interviewDate - submitDate) / (1000 * 60 * 60 * 24));
-        rec.totalTto += diffDays;
-      }
-
-      rec.interviewsCount += 1;
-      if (interview.rating !== null) {
-        rec.totalScore += interview.rating;
-        rec.scoreCount += 1;
+      if (rec) {
+        rec.interviewsCount += 1;
+        if (interview.application) {
+          rec.appsCount += 1;
+          const submitDate = new Date(interview.application.submittedAt);
+          const interviewDate = new Date(interview.dateTime);
+          const diffDays = Math.ceil(Math.abs(interviewDate.getTime() - submitDate.getTime()) / (1000 * 60 * 60 * 24));
+          rec.totalTto += (isNaN(diffDays) ? 0 : diffDays);
+        }
+        if (interview.rating !== null && interview.rating !== undefined && Number(interview.rating) > 0) {
+          rec.totalScore += Number(interview.rating);
+          rec.scoreCount += 1;
+        }
       }
     });
 
     const recruiterEfficiency = Object.values(recruitersMap).map(r => {
-      const avgScore = r.scoreCount > 0 ? (r.totalScore / r.scoreCount) : 4.5;
+      const avgScore = r.scoreCount > 0 ? (r.totalScore / r.scoreCount) : 0;
+      const avgTto = r.appsCount > 0 ? Math.round(r.totalTto / r.appsCount) : 0;
+      const finalScore = r.scoreCount > 0 
+        ? Math.min(100, Math.round((avgScore / 5) * 100))
+        : (r.interviewsCount > 0 ? 70 : 0);
+
       return {
+        id: r.id,
         name: r.name,
-        roles: r.rolesSet.size || 1,
-        apps: r.appsCount || 10,
-        interviews: r.interviewsCount || 5,
-        tto: Math.round(r.totalTto / (r.appsCount || 1)) || 14,
-        score: Math.round((avgScore / 5) * 100) || 90
+        roles: r.rolesCount,
+        apps: r.appsCount,
+        interviews: r.interviewsCount,
+        tto: avgTto,
+        score: finalScore
       };
     });
 
-    // Provide default recruiters if DB is empty
-    if (recruiterEfficiency.length === 0) {
-      recruiterEfficiency.push(
-        { name: 'Sarah Johnson', roles: 12, apps: 420, interviews: 86, tto: 14, score: 98 },
-        { name: 'David Chen', roles: 8, apps: 184, interviews: 42, tto: 19, score: 86 },
-        { name: 'Sam Smith', roles: 4, apps: 92, interviews: 12, tto: 24, score: 72 }
-      );
-    }
-
-    // Calculate Offer Acceptance Rate
+    // 8. Lifecycle Metrics
     const totalOffers = allOffers.length;
-    const acceptedOffers = allOffers.filter(o => o.status === 'Accepted').length;
-    const offerAcceptanceRate = totalOffers > 0 ? Math.round((acceptedOffers / totalOffers) * 100) : 75;
-
-    // Candidate Conversion Rate
+    const acceptedOffers = allOffers.filter(o => ['Accepted', 'ACCEPTED'].includes(o.status)).length;
+    const totalHired = hiredApps.length;
     const totalApplied = allApplications.length;
-    const totalHired = allApplications.filter(a => a.status === 'HIRED').length;
-    const candidateConversion = totalApplied > 0 ? Math.round((totalHired / totalApplied) * 100) : 10;
+    const offerAcceptanceRate = totalOffers > 0 ? Math.round((acceptedOffers / totalOffers) * 100) : (totalHired > 0 ? 100 : 0);
+    const candidateConversion = totalApplied > 0 ? Math.round((totalHired / totalApplied) * 100) : 0;
 
-    // Average Onboarding Time
-    const onboardings = await prisma.onboarding.findMany({
-      where: { status: 'Completed' }
-    });
-    let avgOnboardingTime = 5;
+    let avgOnboardingTime = 0;
     if (onboardings.length > 0) {
       const totalOnbDays = onboardings.reduce((acc, onb) => {
-        const days = Math.ceil(Math.abs(new Date(onb.updatedAt) - new Date(onb.createdAt)) / (1000 * 60 * 60 * 24));
-        return acc + days;
+        const days = Math.ceil(Math.abs(new Date(onb.updatedAt).getTime() - new Date(onb.createdAt).getTime()) / (1000 * 60 * 60 * 24));
+        return acc + (isNaN(days) ? 0 : days);
       }, 0);
-      avgOnboardingTime = Math.round(totalOnbDays / onboardings.length) || 5;
+      avgOnboardingTime = Math.round(totalOnbDays / onboardings.length) || 0;
     }
 
-    // Average Probation Time
-    const confirmedEmployees = await prisma.employeeProfile.findMany({
-      where: { probationStatus: 'CONFIRMED' }
-    });
-    let avgProbationTime = 180;
+    let avgProbationTime = 0;
     if (confirmedEmployees.length > 0) {
       const totalProbDays = confirmedEmployees.reduce((acc, emp) => {
         if (emp.confirmationDate && emp.probationStart) {
-          const days = Math.ceil(Math.abs(new Date(emp.confirmationDate) - new Date(emp.probationStart)) / (1000 * 60 * 60 * 24));
-          return acc + days;
+          const days = Math.ceil(Math.abs(new Date(emp.confirmationDate).getTime() - new Date(emp.probationStart).getTime()) / (1000 * 60 * 60 * 24));
+          return acc + (isNaN(days) ? 0 : days);
         }
-        return acc + 180;
+        return acc + 0;
       }, 0);
-      avgProbationTime = Math.round(totalProbDays / confirmedEmployees.length) || 180;
+      avgProbationTime = Math.round(totalProbDays / confirmedEmployees.length) || 0;
     }
 
-    // Attrition Rate
-    const totalActive = await prisma.employeeProfile.count({
-      where: { lifecycleStatus: { in: ['ACTIVE', 'PROBATION', 'CONFIRMED'] } }
-    });
-    const totalExited = await prisma.exitLifecycle.count({
-      where: { status: 'COMPLETED' }
-    });
-    const attritionRate = totalActive > 0 ? parseFloat(((totalExited / (totalActive + totalExited)) * 100).toFixed(1)) : 4.2;
+    const totalEmployeesOverall = totalActiveEmployees + totalExitedEmployees;
+    const attritionRate = totalEmployeesOverall > 0 
+      ? parseFloat(((totalExitedEmployees / totalEmployeesOverall) * 100).toFixed(1)) 
+      : 0;
 
-    // Department Hiring
-    const deptHiresMap = {};
-    hiredApps.forEach(app => {
-      const dept = app.jobPost?.department || 'General';
-      deptHiresMap[dept] = (deptHiresMap[dept] || 0) + 1;
+    // Departmental Hires (derived directly from real departments)
+    const departmentHiring = allDepartments.map(d => {
+      const deptEmployeesCount = d.employees?.length || 0;
+      const deptHiredApps = hiredApps.filter(a => a.jobPost?.department === d.name || a.jobPost?.departmentId === d.id).length;
+      return {
+        id: d.id,
+        department: d.name,
+        hires: Math.max(deptEmployeesCount, deptHiredApps)
+      };
     });
-    const departmentHiring = Object.entries(deptHiresMap).map(([dept, count]) => ({
-      department: dept,
-      hires: count
-    }));
-    if (departmentHiring.length === 0) {
-      departmentHiring.push(
-        { department: 'Engineering', hires: 8 },
-        { department: 'Sales', hires: 5 },
-        { department: 'Product', hires: 3 }
-      );
-    }
 
-    // Exit Reasons
-    const exits = await prisma.exitLifecycle.findMany({
-      where: { status: 'COMPLETED' }
-    });
+    // Primary Exit Reasons (derived directly from real exit records)
     const exitReasonsMap = {};
-    exits.forEach(ex => {
-      const reason = ex.reason || 'Better Opportunity';
-      const cleanReason = reason.length > 30 ? reason.slice(0, 30) + '...' : reason;
+    allExits.forEach(ex => {
+      const reason = ex.reason || ex.exitType || 'Resignation';
+      const cleanReason = reason.length > 35 ? reason.slice(0, 35) + '...' : reason;
       exitReasonsMap[cleanReason] = (exitReasonsMap[cleanReason] || 0) + 1;
     });
     const exitReasons = Object.entries(exitReasonsMap).map(([reason, count]) => ({
       reason,
       count
     }));
-    if (exitReasons.length === 0) {
-      exitReasons.push(
-        { reason: 'Better Opportunity', count: 4 },
-        { reason: 'Career Growth', count: 2 },
-        { reason: 'Personal Reasons', count: 1 }
-      );
-    }
 
     // Recruitment Funnel
     const funnel = {
       Applied: allApplications.length,
-      Screening: allApplications.filter(a => ['SCREENING', 'UNDER_REVIEW'].includes(a.status)).length,
-      Interviewing: allApplications.filter(a => a.status === 'INTERVIEWING').length,
-      Offered: allApplications.filter(a => a.status === 'OFFERED').length,
+      Screening: allApplications.filter(a => ['SCREENING', 'UNDER_REVIEW', 'APPLIED'].includes(a.status)).length,
+      Interviewing: allApplications.filter(a => ['INTERVIEWING', 'SHORTLISTED'].includes(a.status)).length,
+      Offered: allApplications.filter(a => ['OFFERED', 'OFFER_ACCEPTED'].includes(a.status)).length,
       Hired: totalHired
+    };
+
+    // Filter Options for Frontend UI
+    const filterOptions = {
+      departments: allDepartments.map(d => d.name),
+      recruiters: allRecruiters.map(u => u.employeeProfile?.fullName || u.email.split('@')[0])
     };
 
     return res.status(200).json({
       success: true,
       data: {
         stats: [
-          { label: 'Avg Time to Hire', value: `${avgTimeToHire} Days`, trend: '-2 days', isPositive: true },
-          { label: 'Application Rate', value: `${applicationRate}%`, trend: '+4%', isPositive: true },
-          { label: 'Cost Per Hire', value: `$${costPerHire.toLocaleString()}`, trend: '+$120', isPositive: false },
-          { label: 'Recruiter Score', value: recruiterScore.toString(), trend: '+0.2', isPositive: true },
+          { label: 'Avg Time to Hire', value: `${avgTimeToHire} Days`, trend: avgTimeToHire > 0 ? `${avgTimeToHire}d avg` : '0 days', isPositive: true },
+          { label: 'Application Rate', value: `${applicationRate}%`, trend: `${allApplications.length} apps`, isPositive: true },
+          { label: 'Cost Per Hire', value: `$${costPerHire.toLocaleString()}`, trend: costPerHire > 0 ? 'Optimal' : '$0.00', isPositive: true },
+          { label: 'Recruiter Score', value: recruiterScore.toString(), trend: `${ratedInterviews.length} reviews`, isPositive: true },
         ],
         dailyPerformance,
         weeklyPerformance,
         sources,
         recruiterEfficiency,
+        filterOptions,
         lifecycleMetrics: {
           timeToHire: avgTimeToHire,
           offerAcceptanceRate,

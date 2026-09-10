@@ -10,7 +10,7 @@ const { protect, authorize } = require('../middlewares/authMiddleware');
 
 const {
   getPlatformStats,
-  getAllOrganizations, getOrganizationDetails, provisionOrganization, suspendOrganization, activateOrganization, createOrganization, deleteOrganization, updateOrgSubscription,
+  getAllOrganizations, getOrganizationDetails, provisionOrganization, suspendOrganization, activateOrganization, createOrganization, deleteOrganization, updateOrganization, updateOrgSubscription,
   getAllPlatformUsers, createAdminForOrg,
   toggleAnyUserActive, changeAnyUserRole, revokeAnyUserRole,
   getPlatformAuditLogs,
@@ -21,7 +21,7 @@ const {
   getAllPlatformDepartments, createPlatformDepartment, updatePlatformDepartment, deletePlatformDepartment,
   getPayrollHistory, getPayrollSettings, updatePayrollSettings,
   createPayslip, updatePayslip, deletePayslip, bulkApprovePayslips, generatePayroll, resetUserPassword,
-  getSystemSettings, updateSystemSettings,
+  getSystemSettings, updateSystemSettings, resetSystemSettings,
   getGlobalUsage, getPlatformFeatures, updatePlatformFeatures, togglePlatformFeature
 } = require('../controllers/superAdminController');
 
@@ -41,12 +41,14 @@ router.post('/features/toggle', togglePlatformFeature); // POST /api/superadmin/
 // Settings & Config
 router.get('/settings', getSystemSettings);
 router.put('/settings', updateSystemSettings);
+router.post('/settings/reset', resetSystemSettings);
 
 // Organizations (multi-tenant management)
 router.get('/organizations', getAllOrganizations);   // GET  /api/superadmin/organizations
 router.get('/organizations/:id', getOrganizationDetails); // GET /api/superadmin/organizations/:id
 router.post('/organizations', createOrganization);   // POST /api/superadmin/organizations
 router.post('/organizations/provision', provisionOrganization); // POST /api/superadmin/organizations/provision
+router.put('/organizations/:id', updateOrganization); // PUT  /api/superadmin/organizations/:id
 router.patch('/organizations/:id/suspend', suspendOrganization); // PATCH /api/superadmin/organizations/:id/suspend
 router.patch('/organizations/:id/activate', activateOrganization); // PATCH /api/superadmin/organizations/:id/activate
 router.put('/organizations/:id/subscription', updateOrgSubscription); // PUT /api/superadmin/organizations/:id/subscription

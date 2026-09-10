@@ -144,7 +144,8 @@ const reviewLeave = async (req, res, next) => {
     // Authorization check
     if (!['ADMIN', 'SUPERADMIN', 'HR'].includes(req.user.role)) {
       const managerProfile = await prisma.employeeProfile.findUnique({ where: { userId: req.user.userId } });
-      if (!managerProfile || leave.user.employeeProfile[0]?.managerId !== managerProfile.id) {
+      const empProf = Array.isArray(leave.user.employeeProfile) ? leave.user.employeeProfile[0] : leave.user.employeeProfile;
+      if (!managerProfile || empProf?.managerId !== managerProfile.id) {
         // Allow if it's via generic approval log assignment
         const pendingApprovals = await prisma.approvalLog.findFirst({
           where: { approverId: managerProfile.id, status: 'Pending', entityType: 'LeaveRequest', entityId: leave.id },
@@ -354,6 +355,19 @@ const updateTask = async (req, res, next) => {
 };
 
 // ─────────────────────────────────────────
+// 6b. DELETE TASK  →  DELETE /api/manager/tasks/:id
+// ─────────────────────────────────────────
+const deleteTask = async (req, res, next) => {
+  try {
+    await prisma.task.delete({
+      where: { id: req.params.id }
+    });
+    return res.status(200).json({ success: true, message: 'Task deleted successfully.' });
+  } catch (err) { next(err); }
+};
+
+
+// ─────────────────────────────────────────
 // 7. GET TEAM KPI / PERFORMANCE  →  GET /api/manager/performance
 // ─────────────────────────────────────────
 const getTeamPerformance = async (req, res, next) => {
@@ -416,6 +430,8 @@ const updatePerformanceGoal = async (req, res, next) => {
     const schema = z.object({
       progress: z.number().min(0).max(100).optional(),
       priority: z.enum(['Low', 'Medium', 'High', 'Critical']).optional(),
+      title: z.string().optional(),
+      status: z.string().optional(),
     });
 
     const parsed = schema.safeParse(req.body);
@@ -429,10 +445,21 @@ const updatePerformanceGoal = async (req, res, next) => {
       data: {
         progress: parsed.data.progress !== undefined ? parsed.data.progress : undefined,
         priority: parsed.data.priority || undefined,
+        title: parsed.data.title || undefined,
+        status: parsed.data.status || undefined,
       },
     });
 
     return res.status(200).json({ success: true, data: goal, message: 'Performance goal updated.' });
+  } catch (err) { next(err); }
+};
+
+// DELETE /api/manager/performance/:id
+const deletePerformanceGoal = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    await prisma.performanceGoal.delete({ where: { id } });
+    return res.status(200).json({ success: true, message: 'Performance goal deleted.' });
   } catch (err) { next(err); }
 };
 
@@ -704,34 +731,51 @@ const getOrgEmployees = async (req, res, next) => {
 // ─────────────────────────────────────────
 const addTeamLeaveRequest = async (req, res, next) => {
   try {
+    const rawLeaveType = req.body.leaveType || req.body.type || 'Sick Leave';
     const schema = z.object({
-      employeeId: z.string(), // employeeProfile.id
-      leaveType: z.enum(['Sick Leave', 'Annual Leave', 'Casual Leave', 'Unpaid Leave']),
+      employeeId: z.string(), // employeeProfile.id or userId
+      leaveType: z.string().default('Sick Leave'),
       startDate: z.string(),
       endDate: z.string(),
       reason: z.string().optional().default(''),
+      days: z.any().optional(),
     });
 
-    const parsed = schema.safeParse(req.body);
+    const parsed = schema.safeParse({ ...req.body, leaveType: rawLeaveType });
     if (!parsed.success) {
       const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
       return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
     }
 
-    const { employeeId, leaveType, startDate, endDate, reason } = parsed.data;
+    const { employeeId, leaveType, startDate, endDate, reason, days } = parsed.data;
 
-    const employee = await prisma.employeeProfile.findUnique({
+    let employee = await prisma.employeeProfile.findUnique({
       where: { id: employeeId },
       select: { userId: true },
     });
+    if (!employee) {
+      employee = await prisma.employeeProfile.findFirst({
+        where: { OR: [{ userId: employeeId }, { employeeId: employeeId }] },
+        select: { userId: true }
+      });
+    }
+    if (!employee) {
+      // Check if employeeId is directly a user id
+      const directUser = await prisma.user.findUnique({ where: { id: employeeId } });
+      if (directUser) {
+        employee = { userId: directUser.id };
+      }
+    }
+
     if (!employee) {
       return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Employee not found.' } });
     }
 
     const start = new Date(startDate);
-    const end = new Date(endDate);
+    const end = new Date(endDate || startDate);
     const diffTime = Math.abs(end - start);
-    const totalDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+    const calculatedDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+    const totalDays = Number(days) > 0 ? Number(days) : (isNaN(calculatedDays) ? 1 : calculatedDays);
 
     const leave = await prisma.leaveRequest.create({
       data: {
@@ -787,30 +831,38 @@ const getTeamReviews = async (req, res, next) => {
 // ─────────────────────────────────────────
 const createTeamReview = async (req, res, next) => {
   try {
-    const schema = z.object({
-      employeeId: z.string(),
-      period: z.string(),
-      rating: z.string(),
-      text: z.string(),
-    });
-
-    const parsed = schema.safeParse(req.body);
-    if (!parsed.success) {
-      const msg = parsed.error.issues?.[0]?.message || parsed.error.errors?.[0]?.message || 'Validation error';
-      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: msg } });
+    const { employeeId, period, rating, text, strengths, improvement, summary, status } = req.body;
+    if (!employeeId) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Employee ID is required.' } });
     }
 
     const managerProfile = await prisma.employeeProfile.findUnique({ where: { userId: req.user.userId } });
     const reviewerName = managerProfile ? managerProfile.fullName : 'Manager';
 
+    const fullText = text || JSON.stringify({
+      strengths: strengths || '',
+      improvement: improvement || '',
+      summary: summary || '',
+      status: status || 'Draft'
+    });
+
     const review = await prisma.performanceReview.create({
       data: {
-        employeeId: parsed.data.employeeId,
-        period: parsed.data.period,
+        employeeId: employeeId.toString(),
+        period: period || 'Q4 2026',
         reviewer: reviewerName,
-        rating: parsed.data.rating,
-        text: parsed.data.text,
+        rating: (rating || 4).toString(),
+        text: fullText,
       },
+      include: {
+        employee: {
+          select: {
+            fullName: true,
+            id: true,
+            user: { select: { role: true } }
+          }
+        }
+      }
     });
 
     return res.status(201).json({ success: true, data: review, message: 'Review created successfully.' });
@@ -822,20 +874,60 @@ const createTeamReview = async (req, res, next) => {
 // ─────────────────────────────────────────
 const updateTeamReview = async (req, res, next) => {
   try {
-    const { period, rating, text } = req.body;
+    const { period, rating, text, strengths, improvement, summary, status } = req.body;
+
+    const existing = await prisma.performanceReview.findUnique({ where: { id: req.params.id } });
+    if (!existing) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Review not found.' } });
+    }
+
+    let updatedText = text;
+    if (!updatedText && (strengths !== undefined || improvement !== undefined || summary !== undefined || status !== undefined)) {
+      let currentObj = {};
+      try { currentObj = JSON.parse(existing.text); } catch (e) { currentObj = { text: existing.text }; }
+      updatedText = JSON.stringify({
+        ...currentObj,
+        ...(strengths !== undefined && { strengths }),
+        ...(improvement !== undefined && { improvement }),
+        ...(summary !== undefined && { summary }),
+        ...(status !== undefined && { status }),
+      });
+    }
 
     const updated = await prisma.performanceReview.update({
       where: { id: req.params.id },
       data: {
         ...(period && { period }),
         ...(rating !== undefined && rating !== null && { rating: rating.toString() }),
-        ...(text !== undefined && { text }),
+        ...(updatedText && { text: updatedText }),
       },
+      include: {
+        employee: {
+          select: {
+            fullName: true,
+            id: true,
+            user: { select: { role: true } }
+          }
+        }
+      }
     });
 
     return res.status(200).json({ success: true, data: updated });
   } catch (err) { next(err); }
 };
+
+// ─────────────────────────────────────────
+// 14b. DELETE TEAM REVIEW  →  DELETE /api/manager/reviews/:id
+// ─────────────────────────────────────────
+const deleteTeamReview = async (req, res, next) => {
+  try {
+    await prisma.performanceReview.delete({
+      where: { id: req.params.id }
+    });
+    return res.status(200).json({ success: true, message: 'Review deleted successfully.' });
+  } catch (err) { next(err); }
+};
+
 
 // ─────────────────────────────────────────
 // 15. REQUEST SALARY INCREMENT (ON BEHALF OF EMPLOYEE)  →  POST /api/manager/increments
@@ -1252,7 +1344,7 @@ const getManagerReimbursements = async (req, res, next) => {
         employee: { managerId: managerProfile.id }
       },
       include: {
-        employee: { select: { fullName: true, department: { select: { name: true } }, employeeId: true } }
+        employee: { select: { id: true, fullName: true, avatarUrl: true, department: { select: { name: true } }, employeeId: true } }
       },
       orderBy: { claimedAt: 'desc' }
     });
@@ -1553,12 +1645,12 @@ module.exports = {
   getManagerDashboard,
   getTeam, addTeamMember,
   getTeamLeaves, reviewLeave,
-  assignTask, getTeamTasks, updateTask,
-  getTeamPerformance, addPerformanceGoal, updatePerformanceGoal,
+  assignTask, getTeamTasks, updateTask, deleteTask,
+  getTeamPerformance, addPerformanceGoal, updatePerformanceGoal, deletePerformanceGoal,
   getTeamAttendance, addManualAttendance,
   getOrgEmployees,
   addTeamLeaveRequest,
-  getTeamReviews, createTeamReview, updateTeamReview,
+  getTeamReviews, createTeamReview, updateTeamReview, deleteTeamReview,
   getIncrementRequests, approveIncrementRequest, rejectIncrementRequest,
   getResignations, reviewResignation,
   getManagerReimbursements,

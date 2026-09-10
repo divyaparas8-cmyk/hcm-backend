@@ -18,6 +18,9 @@ const getPricingPlans = async (req, res, next) => {
       include: {
         features: {
           orderBy: { displayOrder: 'asc' }
+        },
+        _count: {
+          select: { organizations: true }
         }
       },
       orderBy: { displayOrder: 'asc' }
@@ -337,9 +340,26 @@ const updatePricingPlan = async (req, res, next) => {
 const deletePricingPlan = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const plan = await prisma.pricingPlan.findUnique({ where: { id } });
+    const plan = await prisma.pricingPlan.findUnique({
+      where: { id },
+      include: {
+        _count: {
+          select: { organizations: true }
+        }
+      }
+    });
     if (!plan) {
       return res.status(404).json({ success: false, error: { message: "Pricing plan not found." } });
+    }
+
+    if (plan._count?.organizations > 0) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'PLAN_IN_USE',
+          message: `Cannot delete pricing plan "${plan.name}" because it is currently assigned to ${plan._count.organizations} active organization(s). Please reassign them to another tier first.`
+        }
+      });
     }
 
     await prisma.pricingPlan.delete({ where: { id } });

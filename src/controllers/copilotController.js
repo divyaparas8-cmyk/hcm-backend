@@ -1,6 +1,61 @@
 const prisma = require('../config/prisma');
+const crypto = require('crypto');
 
 const getAiServerUrl = () => process.env.AI_SERVER_URL || 'http://localhost:4000';
+
+// ═══════════════════════════════════════════════════════════════════
+// IN-MEMORY CONVERSATION HISTORY STORE (with TTL / Auto-cleanup)
+// ═══════════════════════════════════════════════════════════════════
+const conversationStore = new Map();
+const CONVERSATION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function generateConversationId() {
+  return 'conv_' + crypto.randomBytes(8).toString('hex');
+}
+
+function storeMessage(conversationId, messageObj) {
+  if (!conversationId) return;
+  const existing = conversationStore.get(conversationId) || {
+    id: conversationId,
+    createdAt: Date.now(),
+    lastActive: Date.now(),
+    messages: []
+  };
+
+  existing.lastActive = Date.now();
+  existing.messages.push({
+    ...messageObj,
+    timestamp: messageObj.timestamp || new Date().toISOString()
+  });
+
+  // Limit conversation length to 50 messages
+  if (existing.messages.length > 50) {
+    existing.messages = existing.messages.slice(-50);
+  }
+
+  conversationStore.set(conversationId, existing);
+
+  // Periodic cleanup of expired conversations
+  if (conversationStore.size > 200) {
+    const now = Date.now();
+    for (const [id, conv] of conversationStore.entries()) {
+      if (now - conv.lastActive > CONVERSATION_TTL_MS) {
+        conversationStore.delete(id);
+      }
+    }
+  }
+}
+
+function getStoredConversation(conversationId) {
+  if (!conversationId) return null;
+  const conv = conversationStore.get(conversationId);
+  if (!conv) return null;
+  if (Date.now() - conv.lastActive > CONVERSATION_TTL_MS) {
+    conversationStore.delete(conversationId);
+    return null;
+  }
+  return conv;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // 1. DYNAMIC SYSTEM DATE / TIME UTILITY
@@ -83,10 +138,16 @@ const INTENT_PATTERNS = {
     'team performance', 'subordinates', 'team members', 'pending team approvals'
   ],
   RECRUITMENT: [
-    'candidate', 'recruitment', 'job post', 'hiring', 'interview', 'applicant', 'pipeline'
+    'candidate', 'recruitment', 'job post', 'hiring', 'interview', 'applicant', 'pipeline', 'onboarding'
   ],
   CANDIDATE_STATUS: [
     'my application', 'interview schedule', 'application status', 'offer letter candidate'
+  ],
+  ADMIN_OVERVIEW: [
+    'workforce metrics', 'organization summary', 'headcount metrics', 'platform status', 'audit logs', 'backup status'
+  ],
+  SUPERADMIN_STATS: [
+    'platform organization', 'tenant growth', 'system health', 'platform metrics', 'global analytics', 'active tenants'
   ],
   REPORT: [
     'report', 'analytics', 'headcount trend', 'summary trend', 'metrics report', 'export report'
@@ -108,6 +169,15 @@ function detectPrimaryIntent(message) {
   // Check balance before general leave
   if (INTENT_PATTERNS.LEAVE_BALANCE.some(kw => lower.includes(kw))) {
     return 'LEAVE_BALANCE';
+  }
+
+  // Check superadmin & admin metrics
+  if (INTENT_PATTERNS.SUPERADMIN_STATS.some(kw => lower.includes(kw))) {
+    return 'SUPERADMIN_STATS';
+  }
+
+  if (INTENT_PATTERNS.ADMIN_OVERVIEW.some(kw => lower.includes(kw))) {
+    return 'ADMIN_OVERVIEW';
   }
 
   for (const [intent, keywords] of Object.entries(INTENT_PATTERNS)) {
@@ -347,23 +417,47 @@ async function getRoleGatedDatabaseContext({ userId, role, organizationId, inten
 
   // 7. HR / ADMIN ROLE: Org-wide Metrics
   if (['HR', 'ADMIN', 'SUPERADMIN'].includes(role)) {
-    if (['RECRUITMENT', 'REPORT', 'TEAM_ANALYTICS', 'GENERAL'].includes(intent)) {
-      const orgId = organizationId || user.organizationId;
-      const [totalEmployees, activeJobs, pendingLeavesCount] = await Promise.all([
+    if (['RECRUITMENT', 'REPORT', 'TEAM_ANALYTICS', 'ADMIN_OVERVIEW', 'GENERAL'].includes(intent)) {
+      const [totalEmployees, activeJobs, pendingLeavesCount, deptCount, pendingCandidateApps, totalPolicies] = await Promise.all([
         prisma.employeeProfile.count(),
         prisma.jobPost.count({ where: { isActive: true } }),
-        prisma.leaveRequest.count({ where: { status: 'PENDING' } })
+        prisma.leaveRequest.count({ where: { status: 'PENDING' } }),
+        prisma.department.count(),
+        prisma.jobApplication.count({ where: { status: 'PENDING' } }).catch(() => 0),
+        prisma.policy.count().catch(() => 0)
       ]);
 
       context.organizationMetrics = {
         totalHeadcount: totalEmployees,
         activeJobOpenings: activeJobs,
-        orgPendingLeaves: pendingLeavesCount
+        orgPendingLeaves: pendingLeavesCount,
+        totalDepartments: deptCount,
+        pendingApplications: pendingCandidateApps,
+        publishedPolicies: totalPolicies
       };
     }
   }
 
-  // 8. CANDIDATE ROLE: Application Scope
+  // 8. SUPERADMIN: Platform-wide Metrics
+  if (role === 'SUPERADMIN') {
+    if (['SUPERADMIN_STATS', 'ADMIN_OVERVIEW', 'GENERAL'].includes(intent)) {
+      const [totalOrgs, totalUsers, activePlans] = await Promise.all([
+        prisma.organization.count().catch(() => 0),
+        prisma.user.count().catch(() => 0),
+        prisma.pricingPlan.count({ where: { isActive: true } }).catch(() => 0)
+      ]);
+
+      context.platformMetrics = {
+        totalOrganizations: totalOrgs,
+        totalPlatformUsers: totalUsers,
+        activePricingPlans: activePlans,
+        systemHealth: '100% Operational',
+        aiService: 'Online'
+      };
+    }
+  }
+
+  // 9. CANDIDATE ROLE: Application Scope
   if (role === 'CANDIDATE') {
     const candidate = await prisma.candidateProfile.findUnique({
       where: { userId },
@@ -403,6 +497,41 @@ function generateContextualFallback({ intent, verifiedData, user, systemContext,
         answer: `Today is **${systemContext.formattedDate}**.\n\nCurrent server time: **${systemContext.formattedTime}** (${systemContext.timezone}).`,
         actions: []
       };
+
+    case 'SUPERADMIN_STATS': {
+      if (verifiedData.platformMetrics) {
+        const pm = verifiedData.platformMetrics;
+        return {
+          answer: `### Global Platform Status & Tenant Health\n\n• **Total Enterprise Tenants**: **${pm.totalOrganizations}** organizations\n• **Total Registered Users**: **${pm.totalPlatformUsers}** platform accounts\n• **Active Subscription Plans**: **${pm.activePricingPlans}** tiers\n• **Platform Infrastructure**: **${pm.systemHealth}**\n• **AI Copilot Core**: **${pm.aiService}**\n\nAll metrics reflect real-time multi-tenant database records.`,
+          actions: [
+            { label: 'View Organizations', route: '/superadmin/organizations' },
+            { label: 'Platform Analytics', route: '/superadmin/analytics' }
+          ]
+        };
+      }
+      return {
+        answer: `Platform administration metrics are available for authorized Super Administrators.`,
+        actions: [{ label: 'Super Admin Console', route: '/superadmin/dashboard' }]
+      };
+    }
+
+    case 'ADMIN_OVERVIEW': {
+      if (verifiedData.organizationMetrics) {
+        const om = verifiedData.organizationMetrics;
+        return {
+          answer: `### Organization Workforce & Operations Overview\n\n• **Total Active Headcount**: **${om.totalHeadcount}** employees\n• **Configured Departments**: **${om.totalDepartments}** teams\n• **Active Job Openings**: **${om.activeJobOpenings}** positions\n• **Pending Leave Requests**: **${om.orgPendingLeaves}** requests awaiting approval\n• **Published Policies**: **${om.publishedPolicies}** corporate policies\n\nYour organization console is synchronized with real-time operations.`,
+          actions: [
+            { label: 'Admin Dashboard', route: '/admin/dashboard' },
+            { label: 'Manage Employees', route: '/admin/users' },
+            { label: 'Departments', route: '/admin/departments' }
+          ]
+        };
+      }
+      return {
+        answer: `Organization analytics and administrative overviews are available in your Admin Console.`,
+        actions: [{ label: 'Open Admin Console', route: '/admin/dashboard' }]
+      };
+    }
 
     case 'LEAVE_BALANCE': {
       if (!verifiedData.leaves || !verifiedData.leaves.hasRecords) {
@@ -476,7 +605,7 @@ function generateContextualFallback({ intent, verifiedData, user, systemContext,
       if (verifiedData.team) {
         const t = verifiedData.team;
         return {
-          answer: `### Team Leadership Summary\n\n• **Direct Reports**: ${t.teamSize} employees\n• **Pending Leave Approvals**: **${t.pendingTeamLeaveApprovals}** requests\n\nUse your Manager Console to review submitted timesheets, evaluate KPI deliverables, and process pending approvals.`,
+          answer: `### Team Leadership Summary\n\n• **Direct Reports**: **${t.teamSize}** employees\n• **Pending Leave Approvals**: **${t.pendingTeamLeaveApprovals}** requests\n\nUse your Manager Console to review submitted timesheets, evaluate KPI deliverables, and process pending approvals.`,
           actions: [
             { label: 'View Team List', route: '/manager/team' },
             { label: 'Approve Leaves', route: '/manager/leaves' }
@@ -493,10 +622,10 @@ function generateContextualFallback({ intent, verifiedData, user, systemContext,
       if (verifiedData.organizationMetrics) {
         const m = verifiedData.organizationMetrics;
         return {
-          answer: `### Recruitment & Workforce Overview\n\n• **Total Organization Headcount**: ${m.totalHeadcount} employees\n• **Active Job Openings**: ${m.activeJobOpenings} positions\n• **Pending Leave Requests**: ${m.orgPendingLeaves} items`,
+          answer: `### Recruitment & Hiring Pipeline Overview\n\n• **Total Headcount**: **${m.totalHeadcount}** employees\n• **Active Job Openings**: **${m.activeJobOpenings}** positions\n• **Pending Candidate Applications**: **${m.pendingApplications || 0}** candidates\n\nOpen your HR Pipeline to review applicants, schedule interviews, and issue offer letters.`,
           actions: [
             { label: 'Manage Candidates', route: '/hr/candidates' },
-            { label: 'View Job Posts', route: '/hr/pipeline' }
+            { label: 'Hiring Pipeline', route: '/hr/pipeline' }
           ]
         };
       }
@@ -511,7 +640,7 @@ function generateContextualFallback({ intent, verifiedData, user, systemContext,
         const c = verifiedData.candidate;
         const appList = c.applications.map(a => `• **${a.jobTitle}**: Status: **${a.status}** (Applied: ${a.appliedDate})`).join('\n');
         return {
-          answer: `### Your Job Applications\n\n${appList || 'No applications submitted yet.'}`,
+          answer: `### Your Job Applications & Candidate Status\n\n${appList || 'No applications submitted yet.'}\n\nYou can track updates and scheduled interview rounds in your applications hub.`,
           actions: [{ label: 'Track Applications', route: '/candidate/applications' }]
         };
       }
@@ -531,7 +660,144 @@ function generateContextualFallback({ intent, verifiedData, user, systemContext,
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 6. HISTORY SANITIZATION
+// 6. DYNAMIC SUGGESTIONS COMPUTATION
+// ═══════════════════════════════════════════════════════════════════
+function computeDynamicSuggestions({ role = 'EMPLOYEE', pageContext = '', user = {} }) {
+  const normRole = (role || 'EMPLOYEE').toUpperCase();
+  const path = (pageContext || '').toLowerCase();
+
+  // Route-specific prompts
+  if (path.includes('/leaves') || path.includes('/leave')) {
+    if (['MANAGER', 'ADMIN', 'HR'].includes(normRole)) {
+      return [
+        'Who has pending leave requests in my team?',
+        'What is my own leave balance?',
+        'How many total leave requests are pending approval?',
+        'Show standard leave policies and quotas'
+      ];
+    }
+    return [
+      'What is my leave balance?',
+      'Show my pending leave requests',
+      'How many annual leave days do I have remaining?',
+      'How do I apply for casual or sick leave?'
+    ];
+  }
+
+  if (path.includes('/payroll') || path.includes('/compensation')) {
+    if (['ADMIN', 'SUPERADMIN', 'HR'].includes(normRole)) {
+      return [
+        'Summarize active payroll cycles and payout metrics',
+        'Show pending increment requests',
+        'How many employees are on custom salary structures?',
+        'What is our total monthly payroll commitment?'
+      ];
+    }
+    return [
+      'Explain my latest payslip',
+      'What deductions were applied to my salary?',
+      'What is my monthly CTC and compensation?',
+      'When is the next salary disbursement date?'
+    ];
+  }
+
+  if (path.includes('/attendance')) {
+    if (['MANAGER', 'ADMIN', 'HR'].includes(normRole)) {
+      return [
+        'Summarize team attendance and clock-ins today',
+        'Who was marked late today?',
+        'How many employees are currently checked in?',
+        'Show monthly shift schedule distribution'
+      ];
+    }
+    return [
+      'Show my recent attendance punch logs',
+      'What are my shift hours this week?',
+      'Am I marked late for any recent days?',
+      'How do I request an attendance punch correction?'
+    ];
+  }
+
+  if (path.includes('/candidates') || path.includes('/pipeline') || path.includes('/jobs')) {
+    if (normRole === 'CANDIDATE') {
+      return [
+        'What is the status of my job applications?',
+        'When is my next interview scheduled?',
+        'Show available open job opportunities',
+        'How can I improve my AI resume score?'
+      ];
+    }
+    return [
+      'Show recruitment pipeline and application count',
+      'How many candidates are currently in screening?',
+      'Which job openings are currently active?',
+      'Upcoming interview schedules this week'
+    ];
+  }
+
+  if (path.includes('/team')) {
+    return [
+      'Who is on my direct team?',
+      'Who has pending leave requests in my team?',
+      'Summarize team attendance today',
+      'Show team performance goals and deliverables'
+    ];
+  }
+
+  // Default role-specific prompts
+  switch (normRole) {
+    case 'SUPERADMIN':
+      return [
+        'Show platform organization metrics and tenant growth',
+        'What is the current system health and status?',
+        'How many active users are registered across all tenants?',
+        'Summarize global subscription tiers and revenue'
+      ];
+
+    case 'ADMIN':
+      return [
+        'Summarize organization workforce metrics',
+        'Show pending leave and reimbursement approvals',
+        'What is our department and headcount distribution?',
+        'Overview of active payroll cycles and policies'
+      ];
+
+    case 'HR':
+      return [
+        'Show recruitment pipeline summary',
+        'What is our total organization headcount?',
+        'Upcoming interview schedules this week',
+        'Pending employee onboarding and clearance tasks'
+      ];
+
+    case 'MANAGER':
+      return [
+        'Team attendance summary today',
+        'Who has pending leave requests in my team?',
+        'Direct reports and team performance overview',
+        'What is my own leave balance?'
+      ];
+
+    case 'CANDIDATE':
+      return [
+        'What is the status of my job applications?',
+        'When is my next interview scheduled?',
+        'Browse open job positions',
+        'How to update my candidate profile details?'
+      ];
+
+    default: // EMPLOYEE
+      return [
+        'What is my leave balance?',
+        'Explain my latest payslip',
+        'Show my attendance punch logs this week',
+        'What are my active performance goals?'
+      ];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 7. HISTORY SANITIZATION
 // ═══════════════════════════════════════════════════════════════════
 function sanitizeHistory(history) {
   if (!Array.isArray(history)) return [];
@@ -549,11 +815,19 @@ function sanitizeHistory(history) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 7. MAIN CONTROLLER HANDLER: POST /api/copilot/chat
+// 8. MAIN CONTROLLER HANDLER: POST /api/copilot/chat & /api/ai/chat
 // ═══════════════════════════════════════════════════════════════════
 const handleCopilotChat = async (req, res, next) => {
   try {
-    const { message, history = [], pageContext = '' } = req.body;
+    const { 
+      message, 
+      conversationId: clientConvId, 
+      history = [], 
+      pageContext = '',
+      context: reqContext = {}
+    } = req.body;
+
+    const effectivePageContext = pageContext || reqContext.page || '';
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({
@@ -569,11 +843,19 @@ const handleCopilotChat = async (req, res, next) => {
       });
     }
 
+    const conversationId = clientConvId || generateConversationId();
+
     // ── STEP 1: Secure Identity Extraction from JWT (Never trust body) ──
     const userId         = req.user.userId || req.user.id;
     const role           = req.user.role || 'EMPLOYEE';
     const organizationId = req.user.organizationId || null;
     const userEmail      = req.user.email || '';
+
+    // Record user turn in conversation store
+    storeMessage(conversationId, {
+      role: 'user',
+      content: message
+    });
 
     // ── STEP 2: Live Server Date / Time ──
     const systemContext = getSystemDateTimeContext(req.user.timezone || 'UTC');
@@ -601,7 +883,7 @@ const handleCopilotChat = async (req, res, next) => {
     const systemPrompt = buildEnterpriseSystemPrompt({
       user: userProfileSummary,
       systemContext,
-      pageContext
+      pageContext: effectivePageContext
     });
 
     const sanitizedHistory = sanitizeHistory(history);
@@ -610,7 +892,7 @@ const handleCopilotChat = async (req, res, next) => {
 [Authenticated HCM Context:
 ${JSON.stringify(verifiedData, null, 2)}
 ]
-[Current Page: ${pageContext || '/'}]
+[Current Page: ${effectivePageContext || '/'}]
 [Current Server Date: ${systemContext.formattedDate}, Time: ${systemContext.formattedTime}]
 `;
 
@@ -657,7 +939,7 @@ ${JSON.stringify(verifiedData, null, 2)}
         verifiedData,
         user: userProfileSummary,
         systemContext,
-        pageContext
+        pageContext: effectivePageContext
       });
       finalAnswer = fallbackResult.answer;
       fallbackActions = fallbackResult.actions || [];
@@ -676,20 +958,43 @@ ${JSON.stringify(verifiedData, null, 2)}
         fallbackActions.push({ label: 'Team Console', route: '/manager/team' });
       } else if (intent === 'RECRUITMENT' && ['HR', 'ADMIN'].includes(role)) {
         fallbackActions.push({ label: 'Recruitment Hub', route: '/hr/candidates' });
+      } else if (intent === 'ADMIN_OVERVIEW' && ['ADMIN', 'SUPERADMIN'].includes(role)) {
+        fallbackActions.push({ label: 'Admin Dashboard', route: '/admin/dashboard' });
+      } else if (intent === 'SUPERADMIN_STATS' && role === 'SUPERADMIN') {
+        fallbackActions.push({ label: 'Global Analytics', route: '/superadmin/analytics' });
       }
     }
+
+    // Compute dynamic suggestions for next turn
+    const suggestions = computeDynamicSuggestions({
+      role,
+      pageContext: effectivePageContext,
+      user: userProfileSummary
+    });
+
+    // Record assistant turn in conversation store
+    storeMessage(conversationId, {
+      role: 'assistant',
+      content: finalAnswer,
+      actions: fallbackActions
+    });
 
     // ── STEP 7: Return Normalized Enterprise Response ──
     return res.status(200).json({
       success: true,
       data: {
         answer: finalAnswer,
-        intent,
-        sources: [
-          { type: 'authenticated_user_context', verified: true },
-          { type: 'enterprise_database', verified: true }
-        ],
+        conversationId,
+        suggestions,
         actions: fallbackActions,
+        metadata: {
+          intent,
+          confidence: isFallback ? 'verified_database_fallback' : 'high',
+          serverDate: systemContext.currentDateISO,
+          isFallback,
+          role,
+          pageContext: effectivePageContext
+        },
         confidence: isFallback ? 'verified_database_fallback' : 'high',
         serverDate: systemContext.currentDateISO,
         isFallback
@@ -701,9 +1006,65 @@ ${JSON.stringify(verifiedData, null, 2)}
   }
 };
 
+// ═══════════════════════════════════════════════════════════════════
+// 9. CONVERSATION HISTORY HANDLER: GET /api/ai/history/:conversationId
+// ═══════════════════════════════════════════════════════════════════
+const getConversationHistory = async (req, res, next) => {
+  try {
+    const { conversationId } = req.params;
+    if (!conversationId) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'MISSING_ID', message: 'conversationId is required' }
+      });
+    }
+
+    const conversation = getStoredConversation(conversationId);
+    return res.status(200).json({
+      success: true,
+      data: {
+        conversationId,
+        messages: conversation?.messages || []
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// 10. DYNAMIC SUGGESTIONS HANDLER: GET /api/ai/suggestions
+// ═══════════════════════════════════════════════════════════════════
+const getCopilotSuggestions = async (req, res, next) => {
+  try {
+    const role = req.user?.role || req.query.role || 'EMPLOYEE';
+    const pageContext = req.query.page || req.query.pageContext || '';
+
+    const suggestions = computeDynamicSuggestions({
+      role,
+      pageContext,
+      user: req.user
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        role,
+        pageContext,
+        suggestions
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   handleCopilotChat,
+  getConversationHistory,
+  getCopilotSuggestions,
   getSystemDateTimeContext,
   detectPrimaryIntent,
-  generateContextualFallback
+  generateContextualFallback,
+  computeDynamicSuggestions
 };

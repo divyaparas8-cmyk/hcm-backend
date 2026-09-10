@@ -36,6 +36,7 @@ enum LeaveStatus {
   MANAGER_APPROVED
   APPROVED
   REJECTED
+  CANCELLED
 }
 
 enum TicketStatus {
@@ -136,12 +137,17 @@ model Organization {
   supportPhone       String?
   phone              String?
   email              String?
-  timezone           String?
-  currency           String?
+  timezone           String?   @default("UTC-08:00 (Pacific Standard Time)")
+  currency           String?   @default("USD")
+  countryCode        String?   @default("+1")
+  dateFormat         String?   @default("DD/MM/YYYY")
+  twoFactorEnabled   Boolean   @default(true)
+  sessionTimeout     String?   @default("15 Minutes")
   status             String    @default("ACTIVE")
   subscriptionStatus String    @default("TRIAL")
   subscriptionStart  DateTime?
   subscriptionEnd    DateTime?
+  backupRetentionDays Int       @default(30)
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 
@@ -173,6 +179,10 @@ model Organization {
   CustomRole           CustomRole[]
   backupJobs           BackupJob[]
   googleDriveIntegration GoogleDriveIntegration?
+  billingPlans         BillingPlan[]
+  invoices             Invoice[]
+  paymentMethods       OrganizationPaymentMethod[]
+  generatedReports     GeneratedReport[]
 
   @@map("organization")
 }
@@ -199,6 +209,7 @@ model User {
   createdRoles CustomRole[] @relation("RoleCreator")
   updatedRoles CustomRole[] @relation("RoleUpdater")
   createdBackups BackupJob[] @relation("BackupCreator")
+  generatedReports GeneratedReport[] @relation("ReportCreator")
 
   employeeProfile       EmployeeProfile?
   candidateProfile      CandidateProfile?
@@ -348,6 +359,9 @@ model CandidateProfile {
   resumeData        String?   @db.LongText
   profileViews      Int       @default(0)
   resumeDownloads   Int       @default(0)
+  savedJobs         String?   @db.Text
+  resumeScoreHistory String?   @db.LongText
+  interviewChecklist String?   @db.Text
 
   applications JobApplication[]
 
@@ -714,6 +728,7 @@ enum PolicyStatus {
   Expiring_Soon @map("Expiring Soon")
   Renewing
   Archived
+  Resolved
 }
 
 model Policy {
@@ -877,12 +892,15 @@ model Integration {
 }
 
 model BillingPlan {
-  id        String   @id @default(uuid())
-  name      String   @unique
-  price     Int
-  cycle     String // "Monthly" | "Yearly"
-  users     Int
-  addons    String   @default("[]") // JSON array of add‑on names
+  id             String        @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name      String   @default("Professional")
+  price     Int      @default(29)
+  cycle     String   @default("Monthly") // "Monthly" | "Yearly"
+  users     Int      @default(42)
+  addons    String   @default("[\"Premium Support\"]") // JSON array of add-on names
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -890,15 +908,35 @@ model BillingPlan {
 }
 
 model Invoice {
-  id        String   @id @default(uuid())
+  id             String        @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
   date      DateTime @default(now())
   amount    String   @default("$0.00") // formatted amount e.g. "$4,280.00"
-  method    String // e.g. "Visa •••• 4242"
-  status    String // Paid | Refunded | Unpaid
+  method    String   @default("Visa •••• 4242") // e.g. "Visa •••• 4242"
+  status    String   @default("Paid") // Paid | Refunded | Unpaid
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@map("invoice")
+}
+
+model OrganizationPaymentMethod {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  type       String  @default("Visa")
+  last4      String  @default("4242")
+  expiry     String  @default("12/28")
+  cardholder String  @default("Enterprise Client")
+  isDefault  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("organizationpaymentmethod")
 }
 
 // ============================================================
@@ -1015,18 +1053,22 @@ model GlobalSettings {
 // 29. Offer Model
 // ============================================================
 model Offer {
-  id            String          @id @default(uuid())
-  applicationId String?         @unique
-  application   JobApplication? @relation(fields: [applicationId], references: [id], onDelete: Cascade)
-  candidate     String
-  role          String
-  salary        String
-  joiningDate   String
-  status        String          @default("Sent")
-  sentDate      String
-  letterContent String?         @db.LongText
-  createdAt     DateTime        @default(now())
-  updatedAt     DateTime        @updatedAt
+  id             String          @id @default(uuid())
+  applicationId  String?         @unique
+  application    JobApplication? @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  candidate      String
+  role           String
+  salary         String
+  joiningDate    String
+  status         String          @default("Sent")
+  sentDate       String
+  letterContent  String?         @db.LongText
+  expirationDate String?
+  benefits       String?         @db.Text
+  terms          String?         @db.Text
+  documentUrl    String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
 
   @@map("offer")
 }
@@ -1181,6 +1223,20 @@ model PricingFeature {
   displayOrder  Int         @default(0)
 
   @@map("pricingfeature")
+}
+
+model PlatformFeature {
+  id           String   @id
+  name         String
+  category     String
+  description  String   @db.Text
+  icon         String?
+  displayOrder Int      @default(0)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("platformfeature")
 }
 
 // ============================================================
@@ -1686,4 +1742,33 @@ model GoogleDriveIntegration {
   updatedAt       DateTime      @updatedAt
 
   @@map("googledriveintegration")
+}
+
+// ============================================================
+// 37. Generated Reports (Custom Reports persisted to DB)
+// ============================================================
+model GeneratedReport {
+  id             String    @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdByUserId String?
+  createdByUser   User?    @relation("ReportCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  title          String
+  category       String?   // e.g. "Workforce Analytics", "Financial Reports"
+  modules        String?   @db.Text  // JSON array of module IDs
+  format         String?   // e.g. "Executive Summary & Visual Tables"
+  department     String?   // filter: "All Departments" or specific dept
+  period         String?   // e.g. "Current Active Cycle (All-Time)"
+  status         String    @default("Generated") // Generated, Processing, Failed
+  fileSize       String?   // e.g. "142 KB"
+  filePath       String?   @db.Text // future: path to stored PDF/file
+  reportConfig   String?   @db.Text // JSON of full configuration
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([organizationId])
+  @@index([createdAt])
+  @@map("generatedreport")
 }

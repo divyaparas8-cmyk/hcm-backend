@@ -68,7 +68,7 @@ const getBackupOverview = async (req, res, next) => {
         totalBackups,
         totalStorageUsedMB: Number(totalSizeMB),
         allocatedStorageMB: 5120, // 5GB standard tenant allowance
-        retentionDays: 30
+        retentionDays: org?.backupRetentionDays || 30
       }
     });
   } catch (err) { next(err); }
