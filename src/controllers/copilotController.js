@@ -1,7 +1,14 @@
 const prisma = require('../config/prisma');
 const crypto = require('crypto');
 
-const getAiServerUrl = () => process.env.AI_SERVER_URL || 'http://localhost:4000';
+const getAiServerUrl = () => {
+  let url = process.env.AI_SERVER_URL || 'https://hcm-ai-server-production.up.railway.app';
+  url = url.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(url)) {
+    url = `https://${url}`;
+  }
+  return url;
+};
 
 // ═══════════════════════════════════════════════════════════════════
 // IN-MEMORY CONVERSATION HISTORY STORE (with TTL / Auto-cleanup)

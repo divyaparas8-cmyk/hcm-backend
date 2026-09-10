@@ -129,7 +129,8 @@ const applyToJob = async (req, res, next) => {
     let calculatedScore = null;
     if (targetJob) {
       try {
-        const aiServerUrl = process.env.AI_SERVER_URL || 'http://localhost:4000';
+        let rawAiUrl = process.env.AI_SERVER_URL || 'https://hcm-ai-server-production.up.railway.app';
+        const aiServerUrl = /^https?:\/\//i.test(rawAiUrl.trim()) ? rawAiUrl.trim().replace(/\/+$/, '') : `https://${rawAiUrl.trim().replace(/\/+$/, '')}`;
         
         // Build fallback candidate summary text from profile if no raw base64 text is available
         const profileResumeSummary = `Candidate: ${req.body.fullName || profile.fullName || 'Applicant'}
@@ -591,7 +592,7 @@ const getMyOffers = async (req, res, next) => {
                   select: {
                     id: true,
                     name: true,
-                    logo: true
+                    logoUrl: true
                   }
                 }
               }

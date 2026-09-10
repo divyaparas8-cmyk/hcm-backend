@@ -1,7 +1,14 @@
 const http = require('http');
 const fs = require('fs');
 const prisma = require('../config/prisma');
-const getAiServerUrl = () => process.env.AI_SERVER_URL || 'http://localhost:4000';
+const getAiServerUrl = () => {
+  let url = process.env.AI_SERVER_URL || 'https://hcm-ai-server-production.up.railway.app';
+  url = url.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(url)) {
+    url = `https://${url}`;
+  }
+  return url;
+};
 
 // POST /api/employee/ai/resume-builder or /api/candidate/ai/resume-builder
 const aiBuildResume = async (req, res, next) => {
