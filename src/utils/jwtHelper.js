@@ -6,7 +6,7 @@
 
 const jwt = require('jsonwebtoken');
 
-const SECRET = process.env.JWT_SECRET;
+const SECRET = process.env.JWT_SECRET || 'hcm_super_secret_jwt_key_2026';
 const EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
 // Token BANAO (login ke baad call hota hai)
